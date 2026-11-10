@@ -30,7 +30,11 @@ if sys.platform == "win32":
         pass
 
 DIRETORIO_AUTOMACAO_KPI = Path(__file__).resolve().parent
-while DIRETORIO_AUTOMACAO_KPI.name != "AutomacaoKPI" and DIRETORIO_AUTOMACAO_KPI.parent != DIRETORIO_AUTOMACAO_KPI:
+while (
+    not (DIRETORIO_AUTOMACAO_KPI / "Caminhos").exists()
+    and DIRETORIO_AUTOMACAO_KPI.name != "AutomacaoKPI"
+    and DIRETORIO_AUTOMACAO_KPI.parent != DIRETORIO_AUTOMACAO_KPI
+):
     DIRETORIO_AUTOMACAO_KPI = DIRETORIO_AUTOMACAO_KPI.parent
 if str(DIRETORIO_AUTOMACAO_KPI) not in sys.path:
     sys.path.insert(0, str(DIRETORIO_AUTOMACAO_KPI))
@@ -121,12 +125,32 @@ def _eh_valor_turno(val: Any) -> bool:
     return s.startswith("TURNO") or s in ("A", "B", "C", "1º", "2º", "3º", "ADM", "COMERCIAL")
 
 
-def _limpar_valor_colagem(val: Any, eh_coluna_tempo: bool = False) -> Any:
-    """Limpa erros visuais (#VALOR!, #DIV/0!) convertendo para valor limpo."""
+def _eh_valor_horario_ou_tempo(val: Any) -> bool:
     if val is None or val == "":
-        return "0:00" if eh_coluna_tempo else ""
+        return False
+    if isinstance(val, (dt.time, dt.datetime, dt.timedelta)):
+        return True
+    if isinstance(val, (int, float)) and 0.0 <= float(val) < 2.0:
+        return True
+    s = str(val).strip()
+    return (":" in s) or s.startswith("#")
+
+
+def _limpar_valor_colagem(val: Any, eh_coluna_tempo: bool = False) -> Any:
+    """
+    Limpa erros visuais (#VALOR!, #DIV/0!) e converte números decimais de tempo
+    para formato HH:MM:SS ou mantém vazio para preservar fórmulas nativas do KPI.
+    """
+    if val is None or val == "":
+        return ""
     if isinstance(val, str) and val.strip().startswith("#"):
-        return "0:00" if eh_coluna_tempo else ""
+        return "00:00:00" if eh_coluna_tempo else ""
+    if eh_coluna_tempo and isinstance(val, (int, float)):
+        total_sec = max(0, int(round(float(val) * 86400.0)))
+        hh = total_sec // 3600
+        mm = (total_sec % 3600) // 60
+        ss = total_sec % 60
+        return f"{hh:02d}:{mm:02d}:{ss:02d}"
     return sanitizar_valor_excel(val)
 
 
@@ -161,8 +185,7 @@ def transformar_linha_pintura_manual(row_visivel: List[Any]) -> List[Any]:
 
         tem_tempo_em_137 = (
             len(row_visivel) > 137
-            and row_visivel[137] not in (None, "")
-            and (isinstance(row_visivel[137], (dt.time, dt.datetime)) or ":" in str(row_visivel[137]) or str(row_visivel[137]).startswith("#"))
+            and _eh_valor_horario_ou_tempo(row_visivel[137])
         )
 
         if tem_tempo_em_137:

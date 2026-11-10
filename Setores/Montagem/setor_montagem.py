@@ -126,9 +126,13 @@ def extrair_apontamentos_montagem(
                 qtd_raw = r[6] if len(r) > 6 else None
                 turno   = str(r[71] if len(r) > 71 and r[71] is not None else "").strip()
                 inicio  = r[72] if len(r) > 72 else None
+                tem_parada_montagem = any(
+                    (idx_p < len(r) and r[idx_p] not in (None, "", 0, "0"))
+                    for idx_p in (74, 75, 76, 77, 88, 89)
+                )
 
                 qtd_val = float(qtd_raw) if isinstance(qtd_raw, (int, float)) and qtd_raw > 0 else 0.0
-                if qtd_val <= 0 and not turno and inicio in (None, ""):
+                if qtd_val <= 0 and not turno and inicio in (None, "") and not tem_parada_montagem:
                     auditoria["linhas_descartadas_vazias"] += 1
                     continue
 

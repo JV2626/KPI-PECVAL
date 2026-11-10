@@ -119,7 +119,7 @@ def extrair_apontamentos_pintura_automatica(
         if not arq.exists():
             continue
         for nome_aba in cfg["abas_apontamento"]:
-            rows = ler_linhas_planilha(arq, nome_aba, max_col=155)
+            rows = ler_linhas_planilha(arq, nome_aba, max_col=160)
             if len(rows) <= 11:
                 continue
 
@@ -134,7 +134,7 @@ def extrair_apontamentos_pintura_automatica(
 
                 kanban  = str(r[2] if len(r) > 2 and r[2] is not None else "").strip()
                 maquina = str(r[5] if len(r) > 5 and r[5] is not None else "").strip()
-                if not kanban or not maquina:
+                if not kanban and not maquina:
                     auditoria["linhas_descartadas_vazias"] += 1
                     continue
 
@@ -145,6 +145,15 @@ def extrair_apontamentos_pintura_automatica(
                 qtd_val = float(qtd_raw) if isinstance(qtd_raw, (int, float)) and qtd_raw > 0 else 0.0
                 refugo  = float(ref_raw) if isinstance(ref_raw, (int, float)) else 0.0
                 boas    = float(boas_raw) if isinstance(boas_raw, (int, float)) else max(0.0, qtd_val - refugo)
+
+                # Verifica se há horário de início ou parada apontada (não descarta linhas de Parada Não Programada / Setup!)
+                tem_horario_ou_parada = any(
+                    (idx_h < len(r) and r[idx_h] not in (None, "", 0, "0"))
+                    for idx_h in (71, 72, 73, 74, 75, 79, 80, 91, 92)
+                )
+                if qtd_val <= 0 and not (kanban and maquina) and not tem_horario_ou_parada:
+                    auditoria["linhas_descartadas_vazias"] += 1
+                    continue
 
                 auditoria["total_produzido"] += qtd_val
                 auditoria["pecas_refugo"] += refugo

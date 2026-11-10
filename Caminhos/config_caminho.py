@@ -174,6 +174,7 @@ ESTRUTURA_SETORES = {
         "aba_kpi": "APONTAR AQUI ",  # Possui espaço no final no arquivo original
         "linha_cabecalho_kpi": 3,
         "total_colunas_kpi": 146,
+        "colunas_formula_protegidas": set(),
         "abas_apontamento": ["ABA 1", "ABA 2", "ABA 3", "ABA RETRABALHO"],
         "nome_master": "BASE_MASTER_PINTURA_AUTOMATICA.xlsx",
     },
@@ -836,6 +837,52 @@ def obter_caminho_kpi_teste(kpi_oficial: Path) -> Path:
     meses_regex = "|".join(MESES_PT.values())
     stem_limpo = re.sub(rf"\s*-\s*({meses_regex}).*", "", kpi_oficial.stem, flags=re.IGNORECASE).strip()
     return PASTA_TESTES_KPI / f"{stem_limpo} - TESTE.xlsx"
+
+
+def listar_backups_kpi(setor_id: Optional[str] = None, limite: int = 30) -> List[Dict[str, Any]]:
+    """
+    Lista os arquivos de backup (.xlsx) disponíveis em PASTA_BACKUPS,
+    ordenados do mais recente para o mais antigo.
+    """
+    if not PASTA_BACKUPS.exists():
+        return []
+    backups: List[Dict[str, Any]] = []
+    try:
+        arquivos = [
+            f for f in PASTA_BACKUPS.iterdir()
+            if f.is_file() and f.suffix.lower() in (".xlsx", ".xlsm") and not f.name.startswith("~$")
+        ]
+        arquivos.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        for arq in arquivos:
+            n_norm = normalizar_texto(arq.name)
+            setor_det = "DESCONHECIDO"
+            if "injec" in n_norm or "injet" in n_norm:
+                setor_det = "INJECAO"
+            elif "montag" in n_norm:
+                setor_det = "MONTAGEM"
+            elif "pintura" in n_norm and "manual" in n_norm:
+                setor_det = "PINTURA_MANUAL"
+            elif "pintura" in n_norm and ("auto" in n_norm or "robo" in n_norm):
+                setor_det = "PINTURA_AUTOMATICA"
+
+            if setor_id and setor_id != "TODOS" and setor_det != setor_id:
+                continue
+
+            st = arq.stat()
+            backups.append({
+                "nome": arq.name,
+                "caminho": str(arq),
+                "setor_id": setor_det,
+                "tamanho_kb": round(st.st_size / 1024.0, 1),
+                "data_modificacao": dt.datetime.fromtimestamp(st.st_mtime).strftime("%d/%m/%Y %H:%M:%S"),
+                "mtime": st.st_mtime,
+            })
+            if len(backups) >= limite:
+                break
+    except OSError:
+        pass
+    return backups
+
 
 
 def calcular_mes_ano_anterior(ano: int, mes: int) -> Tuple[int, int]:

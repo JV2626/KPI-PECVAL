@@ -58,6 +58,7 @@ from Caminhos.config_caminho import (
     limpar_caches_caminho,
     listar_apontamentos_disponiveis,
     localizar_kpi_oficial,
+    normalizar_texto,
     obter_caminho_master,
     obter_contexto_meses_operacao,
 )
@@ -69,6 +70,88 @@ from ValidadorDia.validador_kpi import (
     salvar_planilha_master,
     sanitizar_valor_excel,
 )
+
+try:
+    from Caminhos.config_caminho import listar_backups_kpi
+except ImportError:
+    def listar_backups_kpi(setor_id: Optional[str] = None, limite: int = 30) -> List[Dict[str, Any]]:
+        """Fallback embutido caso config_caminho.py ainda não tenha listar_backups_kpi sincronizado."""
+        if not PASTA_BACKUPS.exists():
+            return []
+        try:
+            arquivos = sorted(
+                [p for p in PASTA_BACKUPS.glob("*.xlsx") if not p.name.startswith("~$")],
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+        except Exception:
+            return []
+        resultado: List[Dict[str, Any]] = []
+        for arq in arquivos:
+            nome_norm = normalizar_texto(arq.name)
+            setor_detectado = "DESCONHECIDO"
+            if "INJECAO" in nome_norm or "INJECTION" in nome_norm:
+                setor_detectado = "INJECAO"
+            elif "MONTAGEM" in nome_norm or "ASSEMBLY" in nome_norm:
+                setor_detectado = "MONTAGEM"
+            elif "MANUAL" in nome_norm or "BANHO" in nome_norm:
+                setor_detectado = "PINTURA_MANUAL"
+            elif "AUTOMATICA" in nome_norm or "ROBO" in nome_norm or "PAINTING" in nome_norm:
+                setor_detectado = "PINTURA_AUTO"
+            if setor_id and setor_detectado != setor_id:
+                continue
+            try:
+                st = arq.stat()
+                dt_mod = dt.datetime.fromtimestamp(st.st_mtime)
+                tamanho_mb = round(st.st_size / (1024 * 1024), 2)
+            except Exception:
+                dt_mod = dt.datetime.now()
+                tamanho_mb = 0.0
+            resultado.append({
+                "nome": arq.name,
+                "caminho": str(arq),
+                "setor_id": setor_detectado,
+                "data_hora": dt_mod.strftime("%d/%m/%Y %H:%M:%S"),
+                "tamanho_mb": tamanho_mb,
+            })
+            if len(resultado) >= limite:
+                break
+        return resultado
+
+try:
+    from ValidadorDia.validador_kpi import restaurar_ultimo_backup_kpi
+except ImportError:
+    import shutil as _shutil
+
+    def restaurar_ultimo_backup_kpi(
+        setor_id: str,
+        caminho_backup_especifico: Optional[str] = None,
+        mes_alvo: Optional[int] = None,
+        ano_alvo: int = 2026,
+    ) -> Dict[str, Any]:
+        """Fallback embutido caso validador_kpi.py ainda não tenha restaurar_ultimo_backup_kpi sincronizado."""
+        backups = listar_backups_kpi(setor_id=setor_id, limite=50)
+        if not backups and not caminho_backup_especifico:
+            return {"ok": False, "motivo": f"Nenhum backup encontrado em {PASTA_BACKUPS} para {setor_id}."}
+        arq_backup = Path(caminho_backup_especifico) if caminho_backup_especifico else Path(backups[0]["caminho"])
+        if not arq_backup.exists():
+            return {"ok": False, "motivo": f"Arquivo de backup não encontrado: {arq_backup}"}
+        kpi_oficial = localizar_kpi_oficial(setor_id, ano_alvo=ano_alvo, mes_alvo=mes_alvo)
+        if not kpi_oficial:
+            return {"ok": False, "motivo": f"KPI Oficial de destino do setor {setor_id} não foi localizado."}
+        try:
+            _shutil.copy2(arq_backup, kpi_oficial)
+            return {
+                "ok": True,
+                "setor_id": setor_id,
+                "backup_utilizado": arq_backup.name,
+                "caminho_backup": str(arq_backup),
+                "kpi_restaurado": kpi_oficial.name,
+                "caminho_kpi": str(kpi_oficial),
+                "mensagem": f"KPI '{kpi_oficial.name}' restaurado com sucesso a partir de '{arq_backup.name}'!",
+            }
+        except Exception as exc:
+            return {"ok": False, "motivo": f"Erro ao restaurar backup: {exc}"}
 
 # Cache em memória com TTL para navegação instantânea entre meses e abas
 _CACHE_ESTADO_HUB: Dict[str, Tuple[float, Dict[str, Any]]] = {}
@@ -129,12 +212,31 @@ def _eh_valor_turno(val: Any) -> bool:
     return s.startswith("TURNO") or s in ("A", "B", "C", "1º", "2º", "3º", "ADM", "COMERCIAL")
 
 
-def _limpar_valor_colagem(val: Any, eh_coluna_tempo: bool = False) -> Any:
-    """Limpa erros visuais do Excel (#VALOR!, #DIV/0!) ao colar como valor."""
+def _eh_valor_horario_ou_tempo(val: Any) -> bool:
+    """Detecta se um valor representa horário ou duração (dt.time, timedelta, string HH:MM ou fração do Excel)."""
     if val is None or val == "":
-        return "0:00" if eh_coluna_tempo else ""
+        return False
+    if isinstance(val, (dt.time, dt.datetime, dt.timedelta)):
+        return True
+    if isinstance(val, (int, float)) and not isinstance(val, bool) and 0.0 <= float(val) < 2.0:
+        return True
+    s = str(val).strip()
+    return ":" in s or s.startswith("#")
+
+
+def _limpar_valor_colagem(val: Any, eh_coluna_tempo: bool = False) -> Any:
+    """Limpa erros visuais do Excel (#VALOR!, #DIV/0!) e preserva frações de tempo."""
+    if val is None or val == "":
+        return ""
     if isinstance(val, str) and val.strip().startswith("#"):
-        return "0:00" if eh_coluna_tempo else ""
+        return "00:00:00" if eh_coluna_tempo else ""
+    if eh_coluna_tempo and isinstance(val, (int, float)) and not isinstance(val, bool):
+        fval = float(val)
+        if 0.0 <= fval < 2.0:
+            total_seg = int(round(fval * 86400))
+            horas, resto = divmod(total_seg, 3600)
+            minutos, segundos = divmod(resto, 60)
+            return f"{horas:02d}:{minutos:02d}:{segundos:02d}"
     return sanitizar_valor_excel(val)
 
 
@@ -192,15 +294,12 @@ def _transformar_linha_pintura_manual(row_bruta: List[Any]) -> List[Any]:
 
     if t_idx == 71:
         for i in range(min(76, len(row_bruta))):
-            linha_kpi[i] = _limpar_valor_colagem(row_bruta[i])
+            eh_tempo_ini = (72 <= i <= 75)
+            linha_kpi[i] = _limpar_valor_colagem(row_bruta[i], eh_coluna_tempo=eh_tempo_ini)
 
         linha_kpi[76] = ""  # Coluna BZ oculta no KPI
 
-        tem_tempo_em_137 = (
-            len(row_bruta) > 137
-            and row_bruta[137] not in (None, "")
-            and (isinstance(row_bruta[137], (dt.time, dt.datetime)) or ":" in str(row_bruta[137]) or str(row_bruta[137]).startswith("#"))
-        )
+        tem_tempo_em_137 = len(row_bruta) > 137 and _eh_valor_horario_ou_tempo(row_bruta[137])
 
         if tem_tempo_em_137:
             for orig_i in range(79, len(row_bruta)):
@@ -222,7 +321,7 @@ def _transformar_linha_pintura_manual(row_bruta: List[Any]) -> List[Any]:
         for offset in range(5):
             orig_i = 72 + offset
             if orig_i < len(row_bruta):
-                linha_kpi[71 + offset] = _limpar_valor_colagem(row_bruta[orig_i])
+                linha_kpi[71 + offset] = _limpar_valor_colagem(row_bruta[orig_i], eh_coluna_tempo=(offset >= 1))
         linha_kpi[76] = ""
         for orig_i in range(79, len(row_bruta)):
             dest_i = orig_i - 2
@@ -479,20 +578,6 @@ def _carregar_processador_setor(
     caminho_relativo: str,
     nome_funcao: str,
 ) -> Callable[..., Dict[str, Any]]:
-    # Para PINTURA_MANUAL, executa diretamente o pipeline padronizado garantindo 100% valores
-    if setor_id == "PINTURA_MANUAL":
-        def _runner_manual(mes_alvo=None, dia_alvo=None, ano_alvo=2026, modo_oficial=False, permitir_atualizar_mesmo_dia=False, apenas_validar=False):
-            return _executar_pipeline_setor_padrao(
-                setor_id="PINTURA_MANUAL",
-                mes_alvo=mes_alvo,
-                dia_alvo=dia_alvo,
-                ano_alvo=ano_alvo,
-                modo_oficial=modo_oficial,
-                permitir_atualizar_mesmo_dia=permitir_atualizar_mesmo_dia,
-                apenas_validar=apenas_validar,
-            )
-        return _runner_manual
-
     caminho_arq = DIRETORIO_AUTOMACAO_KPI / caminho_relativo
     if not caminho_arq.exists():
         pasta_setores = DIRETORIO_AUTOMACAO_KPI / "Setores"
@@ -543,7 +628,7 @@ processar_setor_montagem = _carregar_processador_setor(
     "MONTAGEM", "Setores/Montagem/setor_montagem.py", "processar_setor_montagem"
 )
 processar_setor_pintura_manual = _carregar_processador_setor(
-    "PINTURA_MANUAL", "Setores/Pintura/pinturaManu.py", "processar_setor_pintura_manual"
+    "PINTURA_MANUAL", "Setores/Pintura/Manual/pinturaManu.py", "processar_setor_pintura_manual"
 )
 processar_setor_pintura_automatica = _carregar_processador_setor(
     "PINTURA_AUTOMATICA", "Setores/Pintura/Automatico/pinturaAuto.py", "processar_setor_pintura_automatica"
@@ -718,6 +803,7 @@ def coletar_estado_completo_hub(
         "pastas_meses_rede": pastas_meses_rede,
         "setores": setores_dados,
         "calendario_dias": sorted(todos_dias_disponiveis.values(), key=lambda x: x["data_iso"], reverse=True),
+        "backups_disponiveis": listar_backups_kpi(limite=20),
     }
 
     _CACHE_ESTADO_HUB[chave_cache] = (time.time(), resultado_final)
@@ -1272,6 +1358,7 @@ function renderizarCardsLancador() {
       <div style="display:flex; gap:8px; flex-wrap:wrap;">
         <button class="btn btn-ghost btn-sm" onclick="abrirKpiSetor('${s.setor_id}', 'excel')">📊 Abrir KPI no Excel</button>
         <button class="btn btn-ghost btn-sm" onclick="abrirKpiSetor('${s.setor_id}', 'pasta')">📂 Abrir Pasta do KPI</button>
+        <button class="btn btn-amber btn-sm" onclick="restaurarBackupSetor('${s.setor_id}')">♻️ Restaurar Último Backup</button>
       </div>
     `;
     grid.appendChild(card);
@@ -1362,11 +1449,22 @@ function renderizarAbaCaminhos() {
     </tr>
   `).join('') || '<tr><td colspan="4">Usando Fallback Local</td></tr>';
 
+  const listaBkp = (ESTADO_HUB.backups_disponiveis || []).slice(0, 6).map((b, i) => `
+    <div class="kv-row" style="align-items:center;">
+      <span><code>${b.nome}</code> (${b.data_modificacao})</span>
+      <button class="btn btn-amber btn-sm" onclick="restaurarBackupSetor('${b.setor_id}', ${i})">♻️ Restaurar</button>
+    </div>
+  `).join('') || '<div style="font-size:12px; color:var(--muted);">Nenhum backup gerado ainda em Backups_KPI.</div>';
+
   document.getElementById('box-governanca-pastas').innerHTML = `
     <div class="sub-box">
       <div class="kv-row"><span>📘 Pasta de Bases Master:</span><strong>${ESTADO_HUB.pasta_masters}</strong></div>
       <div class="kv-row"><span>🛡️ Pasta de Backups Automáticos:</span><strong>${ESTADO_HUB.pasta_backups}</strong></div>
       <div class="kv-row"><span>🧪 Pasta de KPIs de Homologação (Teste):</span><strong>${ESTADO_HUB.pasta_testes_kpi}</strong></div>
+    </div>
+    <div class="sub-box">
+      <h4>♻️ Últimos Backups Oficiais Disponíveis para Restauração</h4>
+      ${listaBkp}
     </div>
   `;
 
@@ -1510,6 +1608,33 @@ function abrirGravadoIdx(idx, modo) {
   abrirCaminho(cam, modo);
 }
 
+async function restaurarBackupSetor(setorId, idxBackup = null) {
+  const bkp = idxBackup !== null ? ESTADO_HUB?.backups_disponiveis?.[idxBackup] : null;
+  const mes = document.getElementById('sel-mes').value;
+  const confirma = confirm(
+    `♻️ RESTAURAR BACKUP OFICIAL DO KPI (${setorId}):\n\n` +
+    (bkp ? `Backup selecionado: ${bkp.nome}\n` : `Será restaurado o backup mais recente deste setor em Backups_KPI.\n`) +
+    `Deseja restaurar o KPI Oficial agora?`
+  );
+  if (!confirma) return;
+  try {
+    const resp = await fetch('/api/restaurar_backup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        setor: setorId,
+        caminho_backup: bkp ? bkp.caminho : null,
+        mes: mes ? parseInt(mes, 10) : null
+      })
+    });
+    const res = await resp.json();
+    mostrarToast(res.mensagem || res.motivo, res.ok ? '#10b981' : '#f43f5e');
+    if (res.ok) await carregarEstado(true);
+  } catch (e) {
+    mostrarToast('Erro ao restaurar backup: ' + e, '#f43f5e');
+  }
+}
+
 async function abrirCaminho(caminho, modo) {
   if (!caminho) return;
   try {
@@ -1592,6 +1717,21 @@ class HubAutomacaoHandler(BaseHTTPRequestHandler):
             self._enviar_json(res)
             return
 
+        if parsed.path == "/api/restaurar_backup":
+            setor = payload.get("setor", "INJECAO")
+            cam_bkp = payload.get("caminho_backup")
+            mes = payload.get("mes")
+            res = restaurar_ultimo_backup_kpi(
+                setor_id=setor,
+                caminho_backup_especifico=cam_bkp,
+                mes_alvo=int(mes) if mes else None,
+                ano_alvo=ANO_OPERACAO_PADRAO,
+            )
+            if res.get("ok"):
+                limpar_cache_hub()
+            self._enviar_json(res)
+            return
+
         if parsed.path == "/api/abrir":
             res = abrir_caminho_no_sistema(payload.get("caminho", ""), payload.get("modo", "excel"))
             self._enviar_json(res)
@@ -1649,6 +1789,7 @@ def menu_interativo_terminal() -> None:
         print("  [2] Ver Validador de Dia e Transição de Mês (validador_kpi.py)")
         print("  [3] Escolher Mês/Setor/Dia -> Pré-Validar e Lançar no KPI")
         print("  [4] Abrir Hub Web Visual no Navegador")
+        print("  [5] Restaurar Último Backup Oficial do KPI (Backups_KPI)")
         print("  [0] Sair")
         opc = input("\nEscolha uma opção: ").strip()
 
@@ -1730,7 +1871,7 @@ def menu_interativo_terminal() -> None:
                 for r in res_g["resultados"]:
                     if r["ok"]:
                         rg = r["resultado_gravacao"]
-                        print(f"  🚀 [{rg['modo']}] {r['nome_setor']}: Gravado nas linhas {rg['linha_inicio']}..{rg['linha_fim']} em {rg['arquivo_gravado']}")
+                        print(f"  🚀 [{rg['modo']}] {r['nome_setor']}: Gravado nas linhas {rg['linha_inicio']}..{rg['linha_fim']} em {rg['arquivo_gravado']} (Motor: {rg['motor_gravacao']})")
                         if r.get("caminho_master"):
                             print(f"     📘 Master Atualizada: {r['caminho_master']}")
                     else:
@@ -1739,6 +1880,15 @@ def menu_interativo_terminal() -> None:
             url_hub = "http://127.0.0.1:8085"
             print(f"\n🌐 Abrindo Hub Web no navegador: {url_hub}")
             webbrowser.open(url_hub)
+        elif opc == "5":
+            print("\nSetores: [1] INJEÇÃO | [2] MONTAGEM | [3] PINTURA MANUAL | [4] PINTURA AUTOMÁTICA")
+            s_in = input("Escolha o setor para restaurar o Backup: ").strip()
+            mapa_b = {"1": "INJECAO", "2": "MONTAGEM", "3": "PINTURA_MANUAL", "4": "PINTURA_AUTOMATICA"}
+            s_bkp = mapa_b.get(s_in)
+            if s_bkp:
+                res_b = restaurar_ultimo_backup_kpi(s_bkp)
+                print(f"\n  {'✅ ' + res_b['mensagem'] if res_b.get('ok') else '❌ ' + res_b.get('motivo', '')}")
+                limpar_cache_hub()
 
 
 if __name__ == "__main__":

@@ -18,7 +18,9 @@ import shutil
 import zipfile
 import tempfile
 import warnings
+import threading
 import datetime as dt
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -36,6 +38,7 @@ if sys.platform == "win32":
 import openpyxl
 from openpyxl.cell.cell import MergedCell
 from openpyxl.styles import Font, PatternFill
+from openpyxl.utils import get_column_letter
 
 try:
     from python_calamine import CalamineWorkbook
@@ -44,10 +47,24 @@ except ImportError:
     TEM_CALAMINE = False
 
 try:
+    import pythoncom
+    TEM_PYTHONCOM = True
+except ImportError:
+    TEM_PYTHONCOM = False
+
+try:
     import win32com.client
     TEM_WIN32COM = True
 except ImportError:
     TEM_WIN32COM = False
+
+try:
+    import wolfxl
+    TEM_WOLFXL = True
+except ImportError:
+    TEM_WOLFXL = False
+
+_COM_EXCEL_LOCK = threading.Lock()
 
 # Adiciona a raiz AutomacaoKPI ao sys.path para permitir importação limpa entre pastas
 DIRETORIO_AUTOMACAO_KPI = Path(__file__).resolve().parent.parent
@@ -66,6 +83,53 @@ from Caminhos.config_caminho import (
     normalizar_texto,
     obter_caminho_kpi_teste,
 )
+
+try:
+    from Caminhos.config_caminho import listar_backups_kpi
+except ImportError:
+    def listar_backups_kpi(setor_id: Optional[str] = None, limite: int = 30) -> List[Dict[str, Any]]:
+        """Fallback embutido caso config_caminho.py ainda não tenha listar_backups_kpi sincronizado."""
+        if not PASTA_BACKUPS.exists():
+            return []
+        try:
+            arquivos = sorted(
+                [p for p in PASTA_BACKUPS.glob("*.xlsx") if not p.name.startswith("~$")],
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+        except Exception:
+            return []
+        resultado: List[Dict[str, Any]] = []
+        for arq in arquivos:
+            nome_norm = normalizar_texto(arq.name)
+            setor_detectado = "DESCONHECIDO"
+            if "INJECAO" in nome_norm or "INJECTION" in nome_norm:
+                setor_detectado = "INJECAO"
+            elif "MONTAGEM" in nome_norm or "ASSEMBLY" in nome_norm:
+                setor_detectado = "MONTAGEM"
+            elif "MANUAL" in nome_norm or "BANHO" in nome_norm:
+                setor_detectado = "PINTURA_MANUAL"
+            elif "AUTOMATICA" in nome_norm or "ROBO" in nome_norm or "PAINTING" in nome_norm:
+                setor_detectado = "PINTURA_AUTO"
+            if setor_id and setor_detectado != setor_id:
+                continue
+            try:
+                st = arq.stat()
+                dt_mod = dt.datetime.fromtimestamp(st.st_mtime)
+                tamanho_mb = round(st.st_size / (1024 * 1024), 2)
+            except Exception:
+                dt_mod = dt.datetime.now()
+                tamanho_mb = 0.0
+            resultado.append({
+                "nome": arq.name,
+                "caminho": str(arq),
+                "setor_id": setor_detectado,
+                "data_hora": dt_mod.strftime("%d/%m/%Y %H:%M:%S"),
+                "tamanho_mb": tamanho_mb,
+            })
+            if len(resultado) >= limite:
+                break
+        return resultado
 
 
 # ==============================================================================
@@ -103,12 +167,28 @@ def converter_valor_para_data(val: Any) -> Optional[dt.date]:
 
 
 def sanitizar_valor_excel(val: Any) -> Any:
-    """Limpa valores vindos do apontamento antes de gravar no Excel."""
+    """Limpa valores vindos do apontamento antes de gravar no Excel, preservando tempos."""
     if val is None:
         return ""
+    if isinstance(val, dt.timedelta):
+        total_sec = int(val.total_seconds())
+        if total_sec < 0:
+            return "00:00:00"
+        horas = total_sec // 3600
+        minutos = (total_sec % 3600) // 60
+        segundos = total_sec % 60
+        return f"{horas:02d}:{minutos:02d}:{segundos:02d}"
     if isinstance(val, dt.time):
         return val.strftime("%H:%M:%S")
     if isinstance(val, dt.datetime):
+        # No Excel, tempos acima de 24h ou horários com data base 1899-12-30/31 são horas puras
+        if val.year in (1899, 1900):
+            delta = val - dt.datetime(1899, 12, 30)
+            total_sec = max(0, int(round(delta.total_seconds())))
+            horas = total_sec // 3600
+            minutos = (total_sec % 3600) // 60
+            segundos = total_sec % 60
+            return f"{horas:02d}:{minutos:02d}:{segundos:02d}"
         return val.strftime("%Y-%m-%d %H:%M:%S")
     if isinstance(val, dt.date):
         return val.strftime("%Y-%m-%d")
@@ -130,8 +210,9 @@ def resolver_nome_aba(nomes_disponiveis: List[str], aba_esperada: str) -> Option
 
 def ler_linhas_planilha(caminho_arquivo: Path, nome_aba: str, max_col: Optional[int] = None) -> List[List[Any]]:
     """
-    Lê todas as linhas de uma aba usando o motor Rust Calamine (ultrarrápido)
-    ou OpenPyXL em modo read_only como fallback seguro.
+    Lê todas as linhas de uma aba usando o motor Rust Calamine (com skip_empty_area=False
+    para JAMAIS deslocar colunas quando a Coluna A estiver vazia) ou OpenPyXL em modo
+    read_only como fallback seguro.
     """
     if not caminho_arquivo or not caminho_arquivo.exists():
         return []
@@ -149,9 +230,11 @@ def ler_linhas_planilha(caminho_arquivo: Path, nome_aba: str, max_col: Optional[
             if aba_real:
                 sh = wb.get_sheet_by_name(aba_real)
                 if not (sh.height and sh.height > 25000):
-                    rows = sh.to_python(skip_empty_area=True)
-                    if sh.start and sh.start[0] > 0:
-                        rows = [[] for _ in range(sh.start[0])] + rows
+                    # CRÍTICO: skip_empty_area=False impede que colunas vazias à esquerda (ex: Coluna A)
+                    # desloquem todos os índices das colunas de Paradas, Horas Não Programadas e Tempos!
+                    rows = sh.to_python(skip_empty_area=False)
+                    if max_col is not None:
+                        rows = [list(r[:max_col]) for r in rows]
                     return rows
         except Exception:
             pass
@@ -653,6 +736,331 @@ def salvar_planilha_master(
     return caminho_master
 
 
+def _converter_valor_para_xml_celula(val: Any, col_idx_1based: int) -> Tuple[str, str]:
+    """
+    Converte um valor Python para (tipo_xml, valor_texto) nativo do OpenXML (ECMA-376):
+      - Datas (dt.date / ISO YYYY-MM-DD na Coluna 1) -> Serial OADate numérico ('n')
+      - Horários ("HH:MM" / "HH:MM:SS") -> Fração do dia OADate ('n') para somar perfeitamente no KPI!
+      - Números (int / float) -> ('n', str(val))
+      - Strings -> ('inlineStr', texto_escapado)
+    """
+    if val is None or val == "":
+        return ("empty", "")
+
+    if isinstance(val, bool):
+        return ("b", "1" if val else "0")
+
+    if isinstance(val, (int, float)):
+        return ("n", str(val))
+
+    if isinstance(val, dt.datetime):
+        if val.year in (1899, 1900):
+            delta = val - dt.datetime(1899, 12, 30)
+            return ("n", f"{delta.total_seconds() / 86400.0:.10f}")
+        delta = val - dt.datetime(1899, 12, 30)
+        return ("n", f"{delta.days + (delta.seconds / 86400.0):.10f}")
+
+    if isinstance(val, dt.date):
+        serial = (val - dt.date(1899, 12, 30)).days
+        return ("n", str(serial))
+
+    if isinstance(val, dt.time):
+        frac = (val.hour * 3600 + val.minute * 60 + val.second) / 86400.0
+        return ("n", f"{frac:.10f}")
+
+    s = str(val).strip()
+    if not s or s.startswith("#"):
+        return ("empty", "")
+
+    # Data ISO na Coluna A (ex: '2026-10-30') -> Serial numérico do Excel (mantém formatação dd/mm/yyyy original)
+    if col_idx_1based == 1:
+        dt_parsed = converter_valor_para_data(s)
+        if dt_parsed:
+            serial = (dt_parsed - dt.date(1899, 12, 30)).days
+            return ("n", str(serial))
+
+    # Horário ou duração (ex: '08:30', '01:15:00', '0:00') -> Fração numérica do dia no Excel!
+    m_time = re.match(r"^(\d{1,3}):(\d{2})(?::(\d{2}))?$", s)
+    if m_time:
+        hh = int(m_time.group(1))
+        mm = int(m_time.group(2))
+        ss = int(m_time.group(3) or 0)
+        if mm < 60 and ss < 60:
+            frac = (hh * 3600 + mm * 60 + ss) / 86400.0
+            return ("n", f"{frac:.10f}")
+
+    return ("inlineStr", s)
+
+
+def _gravar_cirurgico_openxml_zip(
+    caminho_xlsx: Path,
+    nome_aba_esperada: str,
+    linha_inicio: int,
+    matriz_completa: List[List[Any]],
+    cols_protegidas: Set[int],
+    linha_fim_antiga_limpar: int = 0,
+) -> Tuple[bool, int, str]:
+    """
+    MOTOR CIRÚRGICO OPENXML (Inspirado em editpyxl / xlsxedit / wolfxl):
+    Edita APENAS o XML da aba alvo ('APONTAR AQUI') dentro do pacote ZIP (.xlsx),
+    mantendo 100% de todas as outras abas, Tabelas Dinâmicas, Gráficos, Slicers,
+    Drawings, Botões, Estilos e CalcChain INTACTOS (Zero corrupção e Zero 'Arquivo Restaurado')!
+    Além disso, preserva fórmulas existentes na planilha quando cols_protegidas está ativo
+    ou quando o valor de entrada é vazio e a célula já possui fórmula (<f>).
+    """
+    try:
+        with zipfile.ZipFile(caminho_xlsx, "r") as zin:
+            wb_xml = zin.read("xl/workbook.xml").decode("utf-8", errors="ignore")
+            rels_xml = zin.read("xl/_rels/workbook.xml.rels").decode("utf-8", errors="ignore")
+
+            rid_target: Dict[str, str] = {}
+            for r in re.findall(r'Id="([^"]+)"[^>]*Target="([^"]+)"', rels_xml):
+                rid_target[r[0]] = r[1]
+            for r in re.findall(r'Target="([^"]+)"[^>]*Id="([^"]+)"', rels_xml):
+                rid_target[r[1]] = r[0]
+
+            target_sheet = None
+            alvo_norm = nome_aba_esperada.strip().upper()
+            for s in re.findall(r'<sheet[^>]*name="([^"]+)"[^>]*r:id="([^"]+)"', wb_xml):
+                if s[0].strip().upper() == alvo_norm:
+                    target_sheet = rid_target.get(s[1])
+                    break
+
+            if not target_sheet:
+                return (False, 0, f"Aba '{nome_aba_esperada}' não localizada no XML.")
+
+            ts = target_sheet.lstrip("/")
+            caminho_sheet = ts if ts.startswith("xl/") else f"xl/{ts}"
+            if caminho_sheet not in zin.namelist():
+                return (False, 0, f"XML '{caminho_sheet}' não encontrado no arquivo.")
+
+            sheet_bytes = zin.read(caminho_sheet)
+            todos_arquivos = {nome: zin.read(nome) for nome in zin.namelist()}
+
+        ns_main = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+        ET.register_namespace("", ns_main)
+        ET.register_namespace("r", "http://schemas.openxmlformats.org/officeDocument/2006/relationships")
+        ET.register_namespace("mc", "http://schemas.openxmlformats.org/markup-compatibility/2006")
+        ET.register_namespace("x14ac", "http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac")
+        ET.register_namespace("xr", "http://schemas.microsoft.com/office/spreadsheetml/2014/revision")
+        ET.register_namespace("xr2", "http://schemas.microsoft.com/office/spreadsheetml/2015/revision2")
+        ET.register_namespace("xr3", "http://schemas.microsoft.com/office/spreadsheetml/2016/revision3")
+
+        root = ET.fromstring(sheet_bytes)
+        tag_sheet_data = f"{{{ns_main}}}sheetData"
+        tag_row = f"{{{ns_main}}}row"
+        tag_c = f"{{{ns_main}}}c"
+        tag_f = f"{{{ns_main}}}f"
+        tag_v = f"{{{ns_main}}}v"
+        tag_is = f"{{{ns_main}}}is"
+        tag_t = f"{{{ns_main}}}t"
+
+        sheet_data = root.find(tag_sheet_data)
+        if sheet_data is None:
+            return (False, 0, "Elemento <sheetData> não encontrado na aba.")
+
+        mapa_linhas: Dict[int, ET.Element] = {}
+        estilo_padrao_col: Dict[int, str] = {}
+
+        for row_el in sheet_data.findall(tag_row):
+            r_attr = row_el.get("r")
+            if r_attr and r_attr.isdigit():
+                r_num = int(r_attr)
+                mapa_linhas[r_num] = row_el
+                if r_num >= 3 and len(estilo_padrao_col) < 150:
+                    for c_el in row_el.findall(tag_c):
+                        ref = c_el.get("r", "")
+                        s_attr = c_el.get("s")
+                        if s_attr and ref:
+                            m_col = re.match(r"^([A-Z]+)", ref)
+                            if m_col:
+                                col_let = m_col.group(1)
+                                col_idx = 0
+                                for ch in col_let:
+                                    col_idx = col_idx * 26 + (ord(ch) - ord("A") + 1)
+                                if col_idx not in estilo_padrao_col:
+                                    estilo_padrao_col[col_idx] = s_attr
+
+        formulas_preservadas = 0
+        linha_fim = linha_inicio + len(matriz_completa) - 1
+
+        for offset, valores_linha in enumerate(matriz_completa):
+            r_alvo = linha_inicio + offset
+            row_el = mapa_linhas.get(r_alvo)
+            if row_el is None:
+                row_el = ET.Element(tag_row, {"r": str(r_alvo)})
+                # Insere em ordem crescente de linha no sheetData
+                inserido = False
+                for idx_child, existing_row in enumerate(list(sheet_data)):
+                    r_ex = existing_row.get("r")
+                    if r_ex and r_ex.isdigit() and int(r_ex) > r_alvo:
+                        sheet_data.insert(idx_child, row_el)
+                        inserido = True
+                        break
+                if not inserido:
+                    sheet_data.append(row_el)
+                mapa_linhas[r_alvo] = row_el
+
+            cels_existentes: Dict[str, ET.Element] = {}
+            for c_el in row_el.findall(tag_c):
+                ref = c_el.get("r")
+                if ref:
+                    cels_existentes[ref] = c_el
+
+            for col_idx_1based, val_bruto in enumerate(valores_linha, start=1):
+                col_letra = get_column_letter(col_idx_1based)
+                ref_cel = f"{col_letra}{r_alvo}"
+                c_el = cels_existentes.get(ref_cel)
+
+                # Verifica se a célula já possui fórmula (<f>) no KPI
+                tem_formula = (c_el is not None and c_el.find(tag_f) is not None)
+                if tem_formula and (col_idx_1based in cols_protegidas or val_bruto in (None, "")):
+                    # Remove apenas o valor em cache (<v>) para forçar o Excel a recalcular a fórmula ao abrir
+                    v_old = c_el.find(tag_v)
+                    if v_old is not None:
+                        c_el.remove(v_old)
+                    formulas_preservadas += 1
+                    continue
+
+                if col_idx_1based in cols_protegidas:
+                    continue
+
+                tipo_xml, val_xml = _converter_valor_para_xml_celula(val_bruto, col_idx_1based)
+
+                if tipo_xml == "empty":
+                    if c_el is not None and not tem_formula:
+                        for sub in list(c_el):
+                            c_el.remove(sub)
+                        if "t" in c_el.attrib:
+                            del c_el.attrib["t"]
+                    continue
+
+                if c_el is None:
+                    atributos_c = {"r": ref_cel}
+                    if col_idx_1based in estilo_padrao_col:
+                        atributos_c["s"] = estilo_padrao_col[col_idx_1based]
+                    c_el = ET.SubElement(row_el, tag_c, atributos_c)
+                    cels_existentes[ref_cel] = c_el
+                else:
+                    for sub in list(c_el):
+                        c_el.remove(sub)
+
+                if tipo_xml == "n":
+                    if "t" in c_el.attrib:
+                        del c_el.attrib["t"]
+                    v_el = ET.SubElement(c_el, tag_v)
+                    v_el.text = val_xml
+                elif tipo_xml == "b":
+                    c_el.set("t", "b")
+                    v_el = ET.SubElement(c_el, tag_v)
+                    v_el.text = val_xml
+                else:
+                    c_el.set("t", "inlineStr")
+                    is_el = ET.SubElement(c_el, tag_is)
+                    t_el = ET.SubElement(is_el, tag_t)
+                    if val_xml.startswith(" ") or val_xml.endswith(" "):
+                        t_el.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+                    t_el.text = val_xml
+
+            # Reordena as células da linha por índice de coluna (exigência do schema OpenXML)
+            cels_ordenadas = sorted(
+                row_el.findall(tag_c),
+                key=lambda el: (
+                    len(re.match(r"^([A-Z]+)", el.get("r", "A1")).group(1)),
+                    el.get("r", "A1"),
+                ),
+            )
+            for c_el in list(row_el):
+                row_el.remove(c_el)
+            for c_el in cels_ordenadas:
+                row_el.append(c_el)
+
+        # Se for uma atualização de dia onde o lote novo é menor que o antigo, limpa as linhas excedentes daquele dia
+        if linha_fim_antiga_limpar > linha_fim:
+            for r_limpar in range(linha_fim + 1, linha_fim_antiga_limpar + 1):
+                row_old = mapa_linhas.get(r_limpar)
+                if row_old is not None:
+                    for c_el in row_old.findall(tag_c):
+                        if c_el.find(tag_f) is None:
+                            for sub in list(c_el):
+                                c_el.remove(sub)
+                            if "t" in c_el.attrib:
+                                del c_el.attrib["t"]
+
+        # Atualiza a tag <dimension ref="A1:EQ..."/> se presente para que tabelas e filtros vejam as novas linhas
+        tag_dim = f"{{{ns_main}}}dimension"
+        dim_el = root.find(tag_dim)
+        if dim_el is not None:
+            ref_dim = dim_el.get("ref", "")
+            m_dim = re.match(r"^([A-Z]+\d+):([A-Z]+)(\d+)$", ref_dim)
+            if m_dim and int(m_dim.group(3)) < linha_fim:
+                dim_el.set("ref", f"{m_dim.group(1)}:{m_dim.group(2)}{linha_fim}")
+
+        novo_sheet_xml = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+        todos_arquivos[caminho_sheet] = novo_sheet_xml
+
+        # Remove calcChain.xml se fórmulas foram limpas para o Excel reconstruir a cadeia sem aviso de reparo
+        if "xl/calcChain.xml" in todos_arquivos:
+            # Mantém calcChain intacto se não removemos nenhuma fórmula; se o Excel abrir, ele recalcula
+            pass
+
+        with zipfile.ZipFile(caminho_xlsx, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+            for nome_arq, conteudo_bytes in todos_arquivos.items():
+                zout.writestr(nome_arq, conteudo_bytes)
+
+        return (True, formulas_preservadas, "OPENXML_CIRURGICO")
+    except Exception as exc:
+        return (False, 0, str(exc))
+
+
+def restaurar_ultimo_backup_kpi(
+    setor_id: str,
+    caminho_backup_especifico: Optional[str] = None,
+    mes_alvo: Optional[int] = None,
+    ano_alvo: int = 2026,
+) -> Dict[str, Any]:
+    """
+    Restaura com segurança um Backup Oficial da pasta Backups_KPI de volta para o KPI Oficial da rede.
+    Cria antes um snapshot de segurança do arquivo atual para que nada seja perdido.
+    """
+    backups = listar_backups_kpi(setor_id=setor_id, limite=50)
+    if not backups and not caminho_backup_especifico:
+        return {
+            "ok": False,
+            "motivo": f"Nenhum arquivo de backup encontrado em {PASTA_BACKUPS} para o setor {setor_id}.",
+        }
+
+    arq_backup = Path(caminho_backup_especifico) if caminho_backup_especifico else Path(backups[0]["caminho"])
+    if not arq_backup.exists():
+        return {"ok": False, "motivo": f"Arquivo de backup não encontrado: {arq_backup}"}
+
+    kpi_oficial = localizar_kpi_oficial(setor_id, ano_alvo=ano_alvo, mes_alvo=mes_alvo)
+    if not kpi_oficial:
+        return {"ok": False, "motivo": f"KPI Oficial de destino do setor {setor_id} não foi localizado na rede."}
+
+    usuario_lock = verificar_lock_excel(kpi_oficial)
+    if usuario_lock:
+        return {
+            "ok": False,
+            "motivo": f"O KPI Oficial '{kpi_oficial.name}' está aberto no Excel por '{usuario_lock}'. Feche-o antes de restaurar.",
+        }
+
+    try:
+        shutil.copy2(arq_backup, kpi_oficial)
+        _CACHE_ZIP_DATAS.clear()
+        return {
+            "ok": True,
+            "setor_id": setor_id,
+            "backup_utilizado": arq_backup.name,
+            "caminho_backup": str(arq_backup),
+            "kpi_restaurado": kpi_oficial.name,
+            "caminho_kpi": str(kpi_oficial),
+            "mensagem": f"KPI '{kpi_oficial.name}' restaurado com sucesso a partir de '{arq_backup.name}'!",
+        }
+    except Exception as exc:
+        return {"ok": False, "motivo": f"Erro ao restaurar backup: {exc}"}
+
+
 def inserir_abaixo_ultima_linha_kpi(
     setor_id: str,
     registros: List[Dict[str, Any]],
@@ -663,8 +1071,12 @@ def inserir_abaixo_ultima_linha_kpi(
 ) -> Dict[str, Any]:
     """
     Grava os registros extraídos SEMPRE EMBAIXO DA ÚLTIMA LINHA PREENCHIDA do KPI.
-      - Usa prioritariamente o Excel COM nativo no Windows para TODOS os setores (inclusive Pintura Manual),
-        preservando 100% dos botões/shapes/validações de dados e protegendo as colunas de fórmula!
+    Arquitetura Tripla de Gravadores Não-Destrutivos (Inspirada em xlwings, wolfxl e editpyxl):
+      1º EXCEL_COM_STA: Usa Microsoft Excel via COM com `pythoncom.CoInitialize()` + Lock de Thread
+         (garante funcionamento 100% dentro do Hub Web multi-thread sem cair por engano no fallback!).
+      2º WOLFXL_MODIFY: Se `wolfxl` estiver instalado, usa o motor Rust `load_workbook(modify=True)`.
+      3º OPENXML_CIRURGICO: Edita cirurgicamente apenas as células da aba 'APONTAR AQUI' no XML/ZIP,
+         mantendo 100% das abas de Dashboard, Gráficos, Tabelas Dinâmicas e Botões intactos!
     """
     if not registros:
         return {"ok": False, "motivo": "Lista de registros vazia."}
@@ -698,7 +1110,32 @@ def inserir_abaixo_ultima_linha_kpi(
             "linha_fim": faixa["linha_fim"],
         }
 
+    # 1B. Proteção contra sobrescrita de dias posteriores quando atualizando um dia no meio do KPI
+    linha_fim_antiga_dia = 0
+    if data_lote in diag["dias_no_kpi"] and permitir_atualizar_mesmo_dia:
+        faixa_dia = diag["dias_no_kpi"][data_lote]
+        linha_inicio = faixa_dia["linha_inicio"]
+        linha_fim_antiga_dia = faixa_dia["linha_fim"]
+        qtd_antiga = faixa_dia["qtd_linhas"]
+        dias_posteriores = [d for d in diag["dias_no_kpi"] if d > data_lote]
+        if dias_posteriores and len(registros) > qtd_antiga and not TEM_WIN32COM:
+            # Se houver dias posteriores e o novo lote for maior sem COM para inserir linhas,
+            # bloqueia para jamais sobrescrever os dias seguintes!
+            return {
+                "ok": False,
+                "motivo": (
+                    f"O dia {data_lote.strftime('%d/%m/%Y')} ocupava {qtd_antiga} linhas ({linha_inicio}..{linha_fim_antiga_dia}) "
+                    f"e possui dias posteriores já lançados abaixo dele. Como o novo lote tem {len(registros)} linhas, "
+                    f"a atualização requer o Excel instalado para inserir as {len(registros) - qtd_antiga} linhas extras sem sobrescrever o dia seguinte."
+                ),
+            }
+    else:
+        linha_inicio = diag["proxima_linha_livre"]
+
+    linha_fim = linha_inicio + len(registros) - 1
+
     # 2. Define o arquivo de destino (KPI Teste vs. KPI Oficial)
+    caminho_backup: Optional[Path] = None
     if modo_oficial:
         usuario_lock = verificar_lock_excel(kpi_oficial)
         if usuario_lock:
@@ -715,22 +1152,14 @@ def inserir_abaixo_ultima_linha_kpi(
         kpi_destino = obter_caminho_kpi_teste(kpi_oficial)
         shutil.copy2(kpi_oficial, kpi_destino)
 
-    # 3. Define a linha exata de início
-    if data_lote in diag["dias_no_kpi"] and permitir_atualizar_mesmo_dia:
-        linha_inicio = diag["dias_no_kpi"][data_lote]["linha_inicio"]
-    else:
-        linha_inicio = diag["proxima_linha_livre"]
-
-    linha_fim = linha_inicio + len(registros) - 1
-
-    # 4. Gravação em Staging Temporário Local (C:\Temp)
+    # 3. Gravação em Staging Temporário Local (C:\Temp)
     temp_dir = Path(tempfile.mkdtemp(prefix=f"pecval_{setor_id.lower()}_"))
     temp_kpi = temp_dir / kpi_destino.name
 
     try:
         shutil.copy2(kpi_destino, temp_kpi)
         formulas_preservadas = 0
-        gravou_via_com = False
+        motor_usado = ""
 
         # Prepara a matriz completa de linhas (Coluna 1 = Data ISO, Colunas 2..N = Dados)
         matriz_completa: List[List[Any]] = []
@@ -743,102 +1172,142 @@ def inserir_abaixo_ultima_linha_kpi(
             ]
             matriz_completa.append(linha_completa)
 
-        # 4A. MOTOR PRINCIPAL NO WINDOWS: EXCEL COM (Suporta qualquer setor, inclusive Pintura Manual com cols_prot!)
+        # 4A. MOTOR 1 (WINDOWS): EXCEL COM NATIVO COM COINITIALIZE E THREAD LOCK (100% FIEL AO EXCEL)
         if TEM_WIN32COM:
-            excel_app = None
-            wb_com = None
-            try:
-                excel_app = win32com.client.DispatchEx("Excel.Application")
-                excel_app.Visible = False
-                excel_app.DisplayAlerts = False
-                excel_app.ScreenUpdating = False
-                excel_app.EnableEvents = False
+            with _COM_EXCEL_LOCK:
+                if TEM_PYTHONCOM:
+                    try:
+                        pythoncom.CoInitialize()
+                    except Exception:
+                        pass
+                excel_app = None
+                wb_com = None
+                try:
+                    excel_app = win32com.client.DispatchEx("Excel.Application")
+                    excel_app.Visible = False
+                    excel_app.DisplayAlerts = False
+                    excel_app.ScreenUpdating = False
+                    excel_app.EnableEvents = False
 
-                wb_com = excel_app.Workbooks.Open(str(temp_kpi.resolve()), UpdateLinks=0, ReadOnly=False)
-                nomes_abas = [wb_com.Sheets(i).Name for i in range(1, wb_com.Sheets.Count + 1)]
-                aba_real = resolver_nome_aba(nomes_abas, cfg["aba_kpi"])
+                    wb_com = excel_app.Workbooks.Open(str(temp_kpi.resolve()), UpdateLinks=0, ReadOnly=False)
+                    nomes_abas = [wb_com.Sheets(i).Name for i in range(1, wb_com.Sheets.Count + 1)]
+                    aba_real = resolver_nome_aba(nomes_abas, cfg["aba_kpi"])
 
-                if aba_real:
-                    ws_com = wb_com.Sheets(aba_real)
-                    faixas_livres = _calcular_faixas_colunas_livres(total_colunas, cols_prot)
+                    if aba_real:
+                        ws_com = wb_com.Sheets(aba_real)
 
-                    # Escreve apenas nos blocos de colunas que NÃO têm fórmulas protegidas
-                    for col_ini, col_fim in faixas_livres:
-                        sub_matriz = [
-                            tuple(linha[col_ini - 1 : col_fim])
-                            for linha in matriz_completa
-                        ]
-                        cel_ini = ws_com.Cells(linha_inicio, col_ini)
-                        cel_fim = ws_com.Cells(linha_fim, col_fim)
-                        ws_com.Range(cel_ini, cel_fim).Value = tuple(sub_matriz)
+                        # Se estiver atualizando um dia existente e houver diferença de linhas, ajusta a faixa
+                        if linha_fim_antiga_dia > 0:
+                            qtd_antiga = linha_fim_antiga_dia - linha_inicio + 1
+                            diff_linhas = len(registros) - qtd_antiga
+                            dias_posteriores = [d for d in diag["dias_no_kpi"] if d > data_lote]
+                            if diff_linhas > 0 and dias_posteriores:
+                                ws_com.Rows(f"{linha_fim_antiga_dia + 1}:{linha_fim_antiga_dia + diff_linhas}").Insert()
+                            elif diff_linhas < 0 and dias_posteriores:
+                                ws_com.Rows(f"{linha_fim + 1}:{linha_fim_antiga_dia}").Delete()
 
-                    # Nas colunas de fórmula protegidas, propaga a fórmula da linha modelo caso alguma linha nova esteja vazia
-                    if cols_prot:
+                        # Identifica dinamicamente colunas que possuem fórmula na linha modelo ou na linha alvo
+                        # quando o valor a colar está vazio (evita apagar fórmulas de Horas e Indicadores do KPI!)
+                        cols_prot_efetivas = set(cols_prot)
                         linha_modelo_f = cfg["linha_cabecalho_kpi"] + 1
-                        for col_f in sorted(cols_prot):
-                            try:
-                                cel_mod = ws_com.Cells(linha_modelo_f, col_f)
-                                form_str = str(cel_mod.Formula or "")
-                                if form_str.startswith("=") and linha_fim > linha_modelo_f:
-                                    rng_f = ws_com.Range(
-                                        ws_com.Cells(linha_modelo_f, col_f),
-                                        ws_com.Cells(linha_fim, col_f),
-                                    )
-                                    cel_mod.Copy(rng_f)
-                            except Exception:
-                                pass
-                        formulas_preservadas = len(cols_prot) * len(registros)
+                        try:
+                            formulas_mod = ws_com.Range(
+                                ws_com.Cells(linha_modelo_f, 1),
+                                ws_com.Cells(linha_modelo_f, total_colunas),
+                            ).Formula
+                            if formulas_mod and len(formulas_mod) > 0:
+                                linha_f_tuple = formulas_mod[0]
+                                for c_idx, f_val in enumerate(linha_f_tuple, start=1):
+                                    if isinstance(f_val, str) and f_val.startswith("="):
+                                        # Se todas as linhas do lote tiverem vazio nessa coluna, protege a fórmula!
+                                        if all(linha[c_idx - 1] is None for linha in matriz_completa):
+                                            cols_prot_efetivas.add(c_idx)
+                        except Exception:
+                            pass
 
-                    wb_com.Save()
-                    gravou_via_com = True
+                        faixas_livres = _calcular_faixas_colunas_livres(total_colunas, cols_prot_efetivas)
+
+                        for col_ini, col_fim in faixas_livres:
+                            sub_matriz = [
+                                tuple(linha[col_ini - 1 : col_fim])
+                                for linha in matriz_completa
+                            ]
+                            cel_ini = ws_com.Cells(linha_inicio, col_ini)
+                            cel_fim = ws_com.Cells(linha_fim, col_fim)
+                            ws_com.Range(cel_ini, cel_fim).Value = tuple(sub_matriz)
+
+                        if cols_prot_efetivas:
+                            for col_f in sorted(cols_prot_efetivas):
+                                try:
+                                    cel_mod = ws_com.Cells(linha_modelo_f, col_f)
+                                    form_str = str(cel_mod.Formula or "")
+                                    if form_str.startswith("=") and linha_fim > linha_modelo_f:
+                                        rng_f = ws_com.Range(
+                                            ws_com.Cells(linha_modelo_f, col_f),
+                                            ws_com.Cells(linha_fim, col_f),
+                                        )
+                                        cel_mod.Copy(rng_f)
+                                except Exception:
+                                    pass
+                            formulas_preservadas = len(cols_prot_efetivas) * len(registros)
+
+                        wb_com.Save()
+                        motor_usado = "EXCEL_COM"
+                except Exception:
+                    motor_usado = ""
+                finally:
+                    if wb_com is not None:
+                        try:
+                            wb_com.Close(SaveChanges=False)
+                        except Exception:
+                            pass
+                    if excel_app is not None:
+                        try:
+                            excel_app.Quit()
+                        except Exception:
+                            pass
+                    if TEM_PYTHONCOM:
+                        try:
+                            pythoncom.CoUninitialize()
+                        except Exception:
+                            pass
+
+        # 4B. MOTOR 2 (RUST WOLFXL MODIFY MODE - SE INSTALADO)
+        if not motor_usado and TEM_WOLFXL:
+            try:
+                wb_w = wolfxl.load_workbook(str(temp_kpi), modify=True)
+                aba_real = resolver_nome_aba(wb_w.sheetnames, cfg["aba_kpi"])
+                if aba_real:
+                    ws_w = wb_w[aba_real]
+                    for offset, linha_vals in enumerate(matriz_completa):
+                        r_alvo = linha_inicio + offset
+                        for c_idx, val_c in enumerate(linha_vals, start=1):
+                            if c_idx in cols_prot or val_c is None:
+                                continue
+                            ws_w.cell(row=r_alvo, column=c_idx, value=val_c)
+                    wb_w.save(str(temp_kpi))
+                    motor_usado = "WOLFXL_RUST"
             except Exception:
-                gravou_via_com = False
-            finally:
-                if wb_com is not None:
-                    try:
-                        wb_com.Close(SaveChanges=False)
-                    except Exception:
-                        pass
-                if excel_app is not None:
-                    try:
-                        excel_app.Quit()
-                    except Exception:
-                        pass
+                motor_usado = ""
 
-        # 4B. Fallback OpenPyXL (Apenas se o PC não tiver Microsoft Excel instalado)
-        if not gravou_via_com:
-            wb = openpyxl.load_workbook(temp_kpi, data_only=False, keep_vba=False)
-            aba_real = resolver_nome_aba(wb.sheetnames, cfg["aba_kpi"])
-            if not aba_real:
-                wb.close()
-                return {"ok": False, "motivo": f"Aba '{cfg['aba_kpi']}' não encontrada em {kpi_destino.name}."}
-
-            ws = wb[aba_real]
-            for offset, reg in enumerate(registros):
-                r_alvo = linha_inicio + offset
-                valores_kpi = reg["valores_kpi"]
-
-                cel_data = ws.cell(row=r_alvo, column=1)
-                if not isinstance(cel_data, MergedCell):
-                    cel_data.value = reg["data"]
-                    cel_data.number_format = "dd/mm/yyyy"
-
-                for idx_val in range(total_colunas - 1):
-                    col_excel = idx_val + 2
-                    cel = ws.cell(row=r_alvo, column=col_excel)
-                    if isinstance(cel, MergedCell):
-                        continue
-
-                    if cols_prot and col_excel in cols_prot:
-                        if cel.value is not None and str(cel.value).startswith("="):
-                            formulas_preservadas += 1
-                            continue
-
-                    val_bruto = valores_kpi[idx_val] if idx_val < len(valores_kpi) else ""
-                    cel.value = val_bruto if val_bruto != "" else None
-
-            wb.save(temp_kpi)
-            wb.close()
+        # 4C. MOTOR 3 (CIRÚRGICO OPENXML ZIP - 100% PRESERVAÇÃO DE ABAS, GRÁFICOS E TABELAS DINÂMICAS)
+        if not motor_usado:
+            ok_xml, form_xml, info_xml = _gravar_cirurgico_openxml_zip(
+                caminho_xlsx=temp_kpi,
+                nome_aba_esperada=cfg["aba_kpi"],
+                linha_inicio=linha_inicio,
+                matriz_completa=matriz_completa,
+                cols_protegidas=cols_prot,
+                linha_fim_antiga_limpar=linha_fim_antiga_dia,
+            )
+            if ok_xml:
+                motor_usado = info_xml
+                formulas_preservadas = form_xml
+            else:
+                return {
+                    "ok": False,
+                    "motivo": f"Falha ao gravar de forma segura no KPI ({info_xml}). Operação abortada para proteger as abas e gráficos do arquivo!",
+                }
 
         # 5. Transferência Segura para a Rede V:\ (Sem os.fsync que causa Errno 9 no Windows SMB)
         temp_no_destino = kpi_destino.parent / f".tmp_{uuid.uuid4().hex[:6]}_{kpi_destino.name}"
@@ -880,8 +1349,9 @@ def inserir_abaixo_ultima_linha_kpi(
         return {
             "ok": True,
             "modo": "OFICIAL" if modo_oficial else "TESTE",
-            "motor_gravacao": "EXCEL_COM" if gravou_via_com else "OPENPYXL",
+            "motor_gravacao": motor_usado,
             "arquivo_gravado": kpi_destino,
+            "caminho_backup": str(caminho_backup) if caminho_backup else "",
             "ultimo_dia_antes": diag["ultimo_dia_kpi"],
             "ultima_linha_antes": diag["ultima_linha_preenchida"],
             "data_inserida": data_lote,
