@@ -182,6 +182,10 @@ def sanitizar_valor_excel(val: Any) -> Any:
         horas = total_sec // 3600
         minutos = (total_sec % 3600) // 60
         segundos = total_sec % 60
+        # Poka-Yoke: Se horas >= 35088 (1462 dias decorrentes da época 1904 do Excel),
+        # subtrai a época para obter a duração pura da parada (ex: 35090h -> 2h)
+        if horas >= 35088:
+            horas -= 35088
         return f"{horas:02d}:{minutos:02d}:{segundos:02d}"
     if isinstance(val, dt.time):
         return val.strftime("%H:%M:%S")
@@ -197,6 +201,8 @@ def sanitizar_valor_excel(val: Any) -> Any:
                 horas = total_sec // 3600
                 minutos = (total_sec % 3600) // 60
                 segundos = total_sec % 60
+                if horas >= 35088:
+                    horas -= 35088
                 return f"{horas:02d}:{minutos:02d}:{segundos:02d}"
             elif val.year in (1899, 1900):
                 if (val.year == 1899 and val.month == 12 and val.day in (30, 31)) or (val.year == 1900 and val.month == 1 and val.day == 1):
@@ -206,20 +212,42 @@ def sanitizar_valor_excel(val: Any) -> Any:
                 horas = total_sec // 3600
                 minutos = (total_sec % 3600) // 60
                 segundos = total_sec % 60
+                if horas >= 35088:
+                    horas -= 35088
                 return f"{horas:02d}:{minutos:02d}:{segundos:02d}"
             else:
                 return val.strftime("%H:%M:%S")
         return val.strftime("%Y-%m-%d %H:%M:%S")
     if isinstance(val, dt.date):
         return val.strftime("%Y-%m-%d")
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        # Se for número com época 1904 (1460 <= val <= 1465 com parte decimal):
+        # 1462 dias = 01/01/1904 e a parte decimal é o horário puro!
+        if 1460.0 <= val <= 1465.0:
+            frac = float(val) - int(val)
+            if frac > 0.000001:
+                total_sec = int(round(frac * 86400))
+                horas = total_sec // 3600
+                minutos = (total_sec % 3600) // 60
+                segundos = total_sec % 60
+                return f"{horas:02d}:{minutos:02d}:{segundos:02d}"
     if isinstance(val, str):
         s = val.strip()
         if s.startswith("#"):
             return ""
         # Intercepta strings com data base 1899, 1900 ou 1904 (ex: '1904-01-01 18:00:00' -> '18:00:00')
-        m_t = re.match(r"^(?:1899-12-30|1900-01-01|1904-01-01)\s+(\d{1,2}:\d{2}(?::\d{2})?)", s)
+        m_t = re.match(r"^(?:1899-12-30|1900-01-01|1904-01-01)[T\s]+(\d{1,2}:\d{2}(?::\d{2})?)", s)
         if m_t:
             return m_t.group(1)
+        # Intercepta strings com formato de duração com mais de 35000 horas (ex: '35090:10' ou '35090:10:00')
+        m_h = re.match(r"^(\d{4,6}):(\d{2})(?::(\d{2}))?$", s)
+        if m_h:
+            h_val = int(m_h.group(1))
+            m_val = int(m_h.group(2))
+            s_val = int(m_h.group(3)) if m_h.group(3) else 0
+            if h_val >= 35088:
+                h_val -= 35088
+                return f"{h_val:02d}:{m_val:02d}:{s_val:02d}"
         return s
     return val
 

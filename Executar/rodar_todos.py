@@ -250,6 +250,8 @@ def _limpar_valor_colagem(val: Any, eh_coluna_tempo: bool = False) -> Any:
         return "00:00:00" if eh_coluna_tempo else ""
     if eh_coluna_tempo and isinstance(val, (int, float)) and not isinstance(val, bool):
         fval = float(val)
+        if 1460.0 <= fval <= 1465.0:
+            fval -= int(fval)
         if 0.0 <= fval < 2.0:
             total_seg = int(round(fval * 86400))
             horas, resto = divmod(total_seg, 3600)
