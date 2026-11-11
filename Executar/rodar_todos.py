@@ -153,6 +153,24 @@ except ImportError:
         except Exception as exc:
             return {"ok": False, "motivo": f"Erro ao restaurar backup: {exc}"}
 
+try:
+    from Caminhos.config_caminho import (
+        PASTA_KPIS_ZERADOS,
+        ativar_ambiente_teste,
+        desativar_ambiente_teste,
+    )
+except ImportError:
+    PASTA_KPIS_ZERADOS = PASTA_BASE_OPERACAO / "KPIs_Zerados" if "PASTA_BASE_OPERACAO" in globals() else Path("KPIs_Zerados")
+
+    def ativar_ambiente_teste(pasta: Optional[Path] = None) -> Path:
+        p = Path(pasta) if pasta else PASTA_KPIS_ZERADOS
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    def desativar_ambiente_teste() -> None:
+        pass
+
+
 # Cache em memória com TTL para navegação instantânea entre meses e abas
 _CACHE_ESTADO_HUB: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 CACHE_TTL_SEGUNDOS = 300
@@ -1777,7 +1795,198 @@ def iniciar_hub_web(porta_inicial: int = 8085, abrir_navegador: bool = True) -> 
         servidor.serve_forever()
     except KeyboardInterrupt:
         print("\n⏹️ Hub Interativo encerrado pelo usuário.")
-        servidor.server_close()
+def _listar_kpis_na_pasta_teste(pasta: Path) -> Dict[str, Path]:
+    """Varre a pasta de teste e identifica qual KPI pertence a qual setor."""
+    kpis_encontrados: Dict[str, Path] = {}
+    if not pasta.exists():
+        return kpis_encontrados
+
+    for arq in sorted(pasta.glob("*.xlsx")):
+        if arq.name.startswith("~$"):
+            continue
+        nome_norm = normalizar_texto(arq.name)
+        if "master" in nome_norm or "backup" in nome_norm:
+            continue
+
+        if "injec" in nome_norm or "injet" in nome_norm:
+            kpis_encontrados["INJECAO"] = arq
+        elif "montag" in nome_norm:
+            kpis_encontrados["MONTAGEM"] = arq
+        elif "pintura" in nome_norm and "manual" in nome_norm:
+            kpis_encontrados["PINTURA_MANUAL"] = arq
+        elif "pintura" in nome_norm and ("auto" in nome_norm or "robo" in nome_norm):
+            kpis_encontrados["PINTURA_AUTOMATICA"] = arq
+
+    return kpis_encontrados
+
+
+def _executar_teste_kpi_zerado_embutido() -> None:
+    """Executa a rotina completa de testes em ambiente seguro com KPIs zerados diretamente."""
+    print("\n" + "=" * 92)
+    print(" 🧪 AMBIENTE DE HOMOLOGAÇÃO & TESTES EM KPIS ZERADOS — PECVAL")
+    print("=" * 92)
+    print(" 🔒 SEGURANÇA MÁXIMA:")
+    print("    • Os arquivos oficiais da rede (V:\\Producao\\Confidential\\...) NÃO SERÃO TOCADOS.")
+    print("    • A gravação ocorrerá APENAS na sua pasta de testes com os KPIs zerados.")
+    print("=" * 92)
+
+    pasta_padrao = PASTA_KPIS_ZERADOS
+    try:
+        pasta_padrao.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    print(f"\n📂 Pasta padrão para KPIs zerados:")
+    print(f"   👉 {pasta_padrao}")
+    print("\nOpções de pasta:")
+    print("  [ENTER] Usar a pasta padrão acima")
+    print("  [Caminho] Digite ou cole outro caminho onde estão seus KPIs zerados")
+    resp_pasta = input("\nEscolha a pasta: ").strip().strip('"').strip("'")
+
+    pasta_teste = Path(resp_pasta) if resp_pasta else pasta_padrao
+    if not pasta_teste.exists():
+        try:
+            pasta_teste.mkdir(parents=True, exist_ok=True)
+            print(f"  📁 Pasta criada: {pasta_teste}")
+        except Exception as exc:
+            print(f"  ❌ Erro ao acessar/criar pasta: {exc}")
+            return
+
+    ativar_ambiente_teste(pasta_teste)
+
+    try:
+        kpis_detectados = _listar_kpis_na_pasta_teste(pasta_teste)
+        todos_arqs = [f for f in pasta_teste.glob("*.xlsx") if not f.name.startswith("~$")]
+
+        print(f"\n🔍 Verificando arquivos na pasta de testes:")
+        if not todos_arqs:
+            print(f"  ⚠️ Nenhum arquivo .xlsx encontrado em: {pasta_teste}")
+            print("\n  👉 COMO PROCEDER:")
+            print(f"     1. Abra a pasta: {pasta_teste}")
+            print("     2. Cole lá dentro seus arquivos de KPI zerados (modelos em branco).")
+            print("     3. Exemplos de nomes reconhecidos:")
+            print("        • KPI INJEÇÃO 2026.xlsx")
+            print("        • KPI MONTAGEM 2026.xlsx")
+            print("        • KPI PINTURA MANUAL 2026.xlsx")
+            print("        • KPI PINTURA AUTOMÁTICA 2026.xlsx")
+            input("\nDepois de colar os arquivos na pasta, aperte ENTER para continuar...")
+            kpis_detectados = _listar_kpis_na_pasta_teste(pasta_teste)
+            todos_arqs = [f for f in pasta_teste.glob("*.xlsx") if not f.name.startswith("~$")]
+
+        if not todos_arqs:
+            print("  ❌ Nenhum arquivo .xlsx foi colocado na pasta. Teste cancelado.")
+            return
+
+        print(f"\n📋 Arquivos identificados na pasta de testes:")
+        for s_id, cfg in ESTRUTURA_SETORES.items():
+            arq_kpi = kpis_detectados.get(s_id)
+            if arq_kpi:
+                print(f"  ✅ [{s_id}] {cfg['nome_exibicao']}: {arq_kpi.name}")
+            else:
+                print(f"  ⏳ [{s_id}] {cfg['nome_exibicao']}: Nenhum KPI identificado.")
+
+        print("\n" + "-" * 92)
+        print("Qual setor deseja testar agora?")
+        print("  [1] INJEÇÃO")
+        print("  [2] MONTAGEM")
+        print("  [3] PINTURA MANUAL")
+        print("  [4] PINTURA AUTOMÁTICA")
+        print("  [5] TODOS OS SETORES QUE TÊM ARQUIVO ZERADO")
+        print("  [0] Cancelar e Sair")
+        opc_s = input("\nEscolha o setor [Padrão=3 PINTURA MANUAL]: ").strip()
+
+        mapa_opc = {
+            "1": ["INJECAO"],
+            "2": ["MONTAGEM"],
+            "3": ["PINTURA_MANUAL"],
+            "4": ["PINTURA_AUTOMATICA"],
+            "5": [s for s in ESTRUTURA_SETORES if s in kpis_detectados],
+            "": ["PINTURA_MANUAL"],
+        }
+        setores_a_rodar = mapa_opc.get(opc_s, [])
+        if not setores_a_rodar:
+            print("⏹️ Operação cancelada.")
+            return
+
+        setor_ref = setores_a_rodar[0]
+        m_in = input("\nDigite o número do Mês do apontamento real (ex: 10 para Outubro, 11 para Novembro) [ENTER=10]: ").strip()
+        mes_val = int(m_in) if m_in.isdigit() else 10
+
+        aponts = listar_apontamentos_disponiveis(setor_ref, mes_alvo=mes_val)
+        dias_lista = [f"{d.day:02d}" for d in sorted(aponts.keys())]
+        ult_dia_sugestao = dias_lista[-1] if dias_lista else ""
+
+        if dias_lista:
+            print(f"📅 Dias reais com apontamentos na rede ({setor_ref}): [{', '.join(dias_lista)}]")
+            d_in = input(f"Digite o Dia a testar [ENTER = Dia {ult_dia_sugestao} (Automático)]: ").strip()
+        else:
+            d_in = input("Digite o Dia do apontamento [ENTER=Último disponível]: ").strip()
+
+        dia_val = int(d_in) if d_in.isdigit() else (int(ult_dia_sugestao) if ult_dia_sugestao.isdigit() and not d_in else None)
+
+        print("\n" + "=" * 92)
+        print(" 🚀 INICIANDO TESTE CONTROLADO NO KPI ZERADO...")
+        print("=" * 92)
+
+        arquivos_para_abrir: List[Path] = []
+
+        for s_id in setores_a_rodar:
+            cfg = ESTRUTURA_SETORES[s_id]
+            kpi_alvo = kpis_detectados.get(s_id)
+            if not kpi_alvo:
+                print(f"\n⚠️ [{cfg['nome_exibicao']}] Não foi encontrado arquivo zerado para este setor. Pulando...")
+                continue
+
+            print(f"\n--- SETOR: {cfg['nome_exibicao']} ---")
+            print(f"  • KPI Zerado Alvo:  {kpi_alvo.name}")
+            print(f"  • Caminho Completo: {kpi_alvo}")
+
+            diag = diagnosticar_kpi_setor(s_id, caminho_kpi_custom=kpi_alvo, mes_alvo=mes_val)
+            print(f"  • Estado Inicial:   Linha Cabeçalho={diag['linha_cabecalho']} | Última Linha Preenchida={diag['ultima_linha_preenchida']} | Próxima Livre={diag['proxima_linha_livre']}")
+
+            proc_fn = MAPA_PROCESSADORES.get(s_id)
+            if not proc_fn:
+                print(f"  ❌ Processador para {s_id} não encontrado.")
+                continue
+
+            res = proc_fn(
+                mes_alvo=mes_val,
+                dia_alvo=dia_val,
+                ano_alvo=ANO_OPERACAO_PADRAO,
+                modo_oficial=True,
+                permitir_atualizar_mesmo_dia=True,
+                apenas_validar=False,
+            )
+
+            if not res.get("ok"):
+                print(f"  ❌ FALHA NO TESTE: {res.get('motivo')}")
+                continue
+
+            rg = res.get("resultado_gravacao", {})
+            print(f"  🎉 TESTE CONCLUÍDO COM SUCESSO!")
+            print(f"     • Arquivo Gravado:      {rg.get('arquivo_gravado')}")
+            print(f"     • Faixa Preenchida:     Linhas {rg.get('linha_inicio')} até {rg.get('linha_fim')} ({rg.get('linhas_inseridas')} linhas)")
+            print(f"     • Motor Utilizado:      {rg.get('motor_gravacao')}")
+            print(f"     • Fórmulas Preservadas: {rg.get('formulas_preservadas', 0)} célula(s)")
+            print("     🔒 CONFIRMAÇÃO: A pasta oficial de produção Confidential permaneceu 100% INTOCADA.")
+
+            if kpi_alvo not in arquivos_para_abrir:
+                arquivos_para_abrir.append(kpi_alvo)
+
+        print("\n" + "=" * 92)
+        print(" 🎯 TESTE FINALIZADO!")
+        print("=" * 92)
+
+        if arquivos_para_abrir:
+            resp_abrir = input("\n👀 Deseja abrir a planilha de teste no Excel para conferir agora? [S/N]: ").strip().upper()
+            if resp_abrir in ("S", "SIM", "Y", "YES"):
+                for arq in arquivos_para_abrir:
+                    print(f"  📂 Abrindo {arq.name} no Excel...")
+                    abrir_caminho_no_sistema(str(arq), "excel")
+
+    finally:
+        desativar_ambiente_teste()
+        print("\n🔒 Ambiente de testes desativado. Caminhos oficiais restaurados com segurança.")
 
 
 def menu_interativo_terminal() -> None:
@@ -1891,8 +2100,7 @@ def menu_interativo_terminal() -> None:
                 print(f"\n  {'✅ ' + res_b['mensagem'] if res_b.get('ok') else '❌ ' + res_b.get('motivo', '')}")
                 limpar_cache_hub()
         elif opc == "6":
-            from Executar.testar_kpi_zerado import executar_teste_kpi_zerado
-            executar_teste_kpi_zerado()
+            _executar_teste_kpi_zerado_embutido()
 
 
 if __name__ == "__main__":

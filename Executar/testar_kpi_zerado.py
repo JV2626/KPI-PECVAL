@@ -30,7 +30,13 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-DIRETORIO_AUTOMACAO_KPI = Path(__file__).resolve().parent.parent
+DIRETORIO_AUTOMACAO_KPI = Path(__file__).resolve().parent
+while (
+    not (DIRETORIO_AUTOMACAO_KPI / "Caminhos").exists()
+    and DIRETORIO_AUTOMACAO_KPI.name != "AutomacaoKPI"
+    and DIRETORIO_AUTOMACAO_KPI.parent != DIRETORIO_AUTOMACAO_KPI
+):
+    DIRETORIO_AUTOMACAO_KPI = DIRETORIO_AUTOMACAO_KPI.parent
 if str(DIRETORIO_AUTOMACAO_KPI) not in sys.path:
     sys.path.insert(0, str(DIRETORIO_AUTOMACAO_KPI))
 
@@ -52,7 +58,10 @@ from ValidadorDia.validador_kpi import (
     exibir_relatorio_validador,
     salvar_planilha_master,
 )
-from Executar.rodar_todos import MAPA_PROCESSADORES
+try:
+    from Executar.rodar_todos import MAPA_PROCESSADORES
+except ImportError:
+    from rodar_todos import MAPA_PROCESSADORES
 
 
 def abrir_arquivo_excel(caminho: Path) -> None:
