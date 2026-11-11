@@ -29,7 +29,13 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-DIRETORIO_AUTOMACAO_KPI = Path(__file__).resolve().parents[2]
+DIRETORIO_AUTOMACAO_KPI = Path(__file__).resolve().parent
+while (
+    not (DIRETORIO_AUTOMACAO_KPI / "Caminhos").exists()
+    and DIRETORIO_AUTOMACAO_KPI.name != "AutomacaoKPI"
+    and DIRETORIO_AUTOMACAO_KPI.parent != DIRETORIO_AUTOMACAO_KPI
+):
+    DIRETORIO_AUTOMACAO_KPI = DIRETORIO_AUTOMACAO_KPI.parent
 if str(DIRETORIO_AUTOMACAO_KPI) not in sys.path:
     sys.path.insert(0, str(DIRETORIO_AUTOMACAO_KPI))
 
@@ -99,7 +105,7 @@ def extrair_apontamentos_injecao(
         )
 
         for nome_aba in cfg["abas_apontamento"]:
-            rows = ler_linhas_planilha(arq, nome_aba, max_col=145)
+            rows = ler_linhas_planilha(arq, nome_aba, max_col=160)
             if len(rows) <= 11:
                 continue
 
@@ -114,7 +120,13 @@ def extrair_apontamentos_injecao(
                 kanban   = str(r[2] if len(r) > 2 and r[2] is not None else "").strip()
                 maquina  = str(r[5] if len(r) > 5 and r[5] is not None else "").strip()
 
-                if not kanban and not maquina and not operador:
+                # Verifica se há parada, motivo ou horário preenchido para não descartar apontamento de setup/parada
+                tem_parada_ou_horario = any(
+                    (len(r) > col_i and r[col_i] not in (None, "", "0", 0, "0:00", 0.0))
+                    for col_i in range(70, min(len(r), 138))
+                )
+
+                if not kanban and not maquina and not operador and not tem_parada_ou_horario:
                     auditoria["linhas_descartadas_vazias"] += 1
                     continue
 
@@ -156,6 +168,7 @@ def processar_setor_injecao(
     modo_oficial: bool = False,
     permitir_atualizar_mesmo_dia: bool = False,
     apenas_validar: bool = False,
+    caminho_kpi_custom: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """
     Executa o fluxo completo do Setor 01 (Injeção Plástica):
@@ -165,7 +178,12 @@ def processar_setor_injecao(
       4. Extrai os apontamentos, valida contra o KPI e grava (em Modo Teste ou Oficial).
     """
     cfg = ESTRUTURA_SETORES[SETOR_ID]
-    diag = diagnosticar_kpi_setor(SETOR_ID, mes_alvo=mes_alvo, ano_alvo=ano_alvo)
+    diag = diagnosticar_kpi_setor(
+        SETOR_ID,
+        caminho_kpi_custom=caminho_kpi_custom,
+        mes_alvo=mes_alvo,
+        ano_alvo=ano_alvo,
+    )
     mes_efetivo = diag.get("mes_detectado") or mes_alvo
     apontamentos_map = listar_apontamentos_disponiveis(SETOR_ID, mes_alvo=mes_efetivo, ano_alvo=ano_alvo)
 
