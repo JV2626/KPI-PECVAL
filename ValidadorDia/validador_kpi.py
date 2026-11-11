@@ -172,7 +172,7 @@ def converter_valor_para_data(val: Any) -> Optional[dt.date]:
 
 
 def sanitizar_valor_excel(val: Any) -> Any:
-    """Limpa valores vindos do apontamento antes de gravar no Excel, preservando tempos."""
+    """Limpa valores vindos do apontamento antes de gravar no Excel, preservando tempos e paradas."""
     if val is None:
         return ""
     if isinstance(val, dt.timedelta):
@@ -186,19 +186,41 @@ def sanitizar_valor_excel(val: Any) -> Any:
     if isinstance(val, dt.time):
         return val.strftime("%H:%M:%S")
     if isinstance(val, dt.datetime):
-        # No Excel, tempos acima de 24h ou horários com data base 1899-12-30/31 são horas puras
-        if val.year in (1899, 1900):
-            delta = val - dt.datetime(1899, 12, 30)
-            total_sec = max(0, int(round(delta.total_seconds())))
-            horas = total_sec // 3600
-            minutos = (total_sec % 3600) // 60
-            segundos = total_sec % 60
-            return f"{horas:02d}:{minutos:02d}:{segundos:02d}"
+        # No Excel, horários/paradas/durações com ano base menor que 1950 (1899, 1900 ou 1904)
+        # são HORÁRIOS PUROS e JAMAIS devem ser gravados com ano de calendário (o que causava 35.100 horas)!
+        if val.year < 1950:
+            if val.year == 1904 and (val.month == 1 and val.day == 1):
+                return val.strftime("%H:%M:%S")
+            elif val.year == 1904:
+                delta = val - dt.datetime(1904, 1, 1)
+                total_sec = max(0, int(round(delta.total_seconds())))
+                horas = total_sec // 3600
+                minutos = (total_sec % 3600) // 60
+                segundos = total_sec % 60
+                return f"{horas:02d}:{minutos:02d}:{segundos:02d}"
+            elif val.year in (1899, 1900):
+                if (val.year == 1899 and val.month == 12 and val.day in (30, 31)) or (val.year == 1900 and val.month == 1 and val.day == 1):
+                    return val.strftime("%H:%M:%S")
+                delta = val - dt.datetime(1899, 12, 30)
+                total_sec = max(0, int(round(delta.total_seconds())))
+                horas = total_sec // 3600
+                minutos = (total_sec % 3600) // 60
+                segundos = total_sec % 60
+                return f"{horas:02d}:{minutos:02d}:{segundos:02d}"
+            else:
+                return val.strftime("%H:%M:%S")
         return val.strftime("%Y-%m-%d %H:%M:%S")
     if isinstance(val, dt.date):
         return val.strftime("%Y-%m-%d")
-    if isinstance(val, str) and val.strip().startswith("#"):
-        return ""
+    if isinstance(val, str):
+        s = val.strip()
+        if s.startswith("#"):
+            return ""
+        # Intercepta strings com data base 1899, 1900 ou 1904 (ex: '1904-01-01 18:00:00' -> '18:00:00')
+        m_t = re.match(r"^(?:1899-12-30|1900-01-01|1904-01-01)\s+(\d{1,2}:\d{2}(?::\d{2})?)", s)
+        if m_t:
+            return m_t.group(1)
+        return s
     return val
 
 

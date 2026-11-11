@@ -108,22 +108,36 @@ def extrair_apontamentos_montagem(
             auditoria["linhas_brutas_lidas"] += (len(rows) - 11)
             auditoria["detalhes_abas"].setdefault(nome_aba, {"linhas": 0, "pecas": 0.0, "refugo": 0.0})
 
+            vazias_consecutivas = 0
             for r_idx in range(11, len(rows)):
                 r = list(rows[r_idx])
                 if not r or len(r) < 6:
                     auditoria["linhas_descartadas_vazias"] += 1
+                    vazias_consecutivas += 1
+                    if vazias_consecutivas >= 100:
+                        break
                     continue
 
                 if len(r) < 145:
                     r.extend([""] * (145 - len(r)))
 
-                kanban  = str(r[2] if r[2] is not None else "").strip()
-                maquina = str(r[5] if r[5] is not None else "").strip()
-                if not kanban or not maquina:
-                    auditoria["linhas_descartadas_vazias"] += 1
-                    continue
+                operador = str(r[1] if len(r) > 1 and r[1] is not None else "").strip()
+                kanban   = str(r[2] if len(r) > 2 and r[2] is not None else "").strip()
+                bancada  = str(r[4] if len(r) > 4 and r[4] is not None else "").strip()
+                maquina  = str(r[5] if len(r) > 5 and r[5] is not None else "").strip()
 
                 qtd_raw = r[6] if len(r) > 6 else None
+                qtd_val = float(qtd_raw) if isinstance(qtd_raw, (int, float)) and qtd_raw > 0 else 0.0
+
+                # Poka-Yoke: Jamais descarta linha com peças produzidas (ex: Bancada 30) ou identificação válida
+                tem_id = bool(kanban or maquina or bancada or operador)
+                if not tem_id and qtd_val <= 0:
+                    auditoria["linhas_descartadas_vazias"] += 1
+                    vazias_consecutivas += 1
+                    if vazias_consecutivas >= 100:
+                        break
+                    continue
+
                 turno   = str(r[71] if len(r) > 71 and r[71] is not None else "").strip()
                 inicio  = r[72] if len(r) > 72 else None
                 tem_parada_montagem = any(
@@ -131,10 +145,14 @@ def extrair_apontamentos_montagem(
                     for idx_p in (74, 75, 76, 77, 88, 89)
                 )
 
-                qtd_val = float(qtd_raw) if isinstance(qtd_raw, (int, float)) and qtd_raw > 0 else 0.0
                 if qtd_val <= 0 and not turno and inicio in (None, "") and not tem_parada_montagem:
                     auditoria["linhas_descartadas_vazias"] += 1
+                    vazias_consecutivas += 1
+                    if vazias_consecutivas >= 100:
+                        break
                     continue
+
+                vazias_consecutivas = 0
 
                 ref_raw = r[65] if len(r) > 65 else 0.0
                 qtd = float(qtd_raw) if isinstance(qtd_raw, (int, float)) else 0.0

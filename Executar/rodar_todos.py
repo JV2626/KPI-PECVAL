@@ -406,6 +406,17 @@ def _extrair_registros_setor_padrao(
                         if vazias_consecutivas >= 100:
                             break
                         continue
+                elif setor_id == "MONTAGEM":
+                    bancada = str(r[4] if len(r) > 4 and r[4] is not None else "").strip()
+                    tem_id = bool(kanban or maquina or bancada or operador)
+                    qtd_raw_temp = r[6] if len(r) > 6 else None
+                    qtd_val_temp = float(qtd_raw_temp) if isinstance(qtd_raw_temp, (int, float)) and qtd_raw_temp > 0 else 0.0
+                    if not tem_id and qtd_val_temp <= 0:
+                        auditoria["linhas_descartadas_vazias"] += 1
+                        vazias_consecutivas += 1
+                        if vazias_consecutivas >= 100:
+                            break
+                        continue
                 else:
                     if not kanban or not maquina:
                         auditoria["linhas_descartadas_vazias"] += 1
@@ -417,13 +428,15 @@ def _extrair_registros_setor_padrao(
                 vazias_consecutivas = 0
 
                 if setor_id == "MONTAGEM":
-                    if len(r) < 72:
-                        auditoria["linhas_descartadas_vazias"] += 1
-                        continue
                     qtd_raw = r[6] if len(r) > 6 else None
+                    qtd_val_m = float(qtd_raw) if isinstance(qtd_raw, (int, float)) and qtd_raw > 0 else 0.0
                     turno   = str(r[71] if len(r) > 71 and r[71] is not None else "").strip()
                     inicio  = r[72] if len(r) > 72 else None
-                    if qtd_raw in (None, "") and not turno and inicio in (None, ""):
+                    tem_parada_m = any(
+                        (idx_p < len(r) and r[idx_p] not in (None, "", 0, "0"))
+                        for idx_p in (74, 75, 76, 77, 88, 89)
+                    )
+                    if qtd_val_m <= 0 and not turno and inicio in (None, "") and not tem_parada_m:
                         auditoria["linhas_descartadas_vazias"] += 1
                         continue
 
