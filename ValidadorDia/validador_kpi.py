@@ -85,6 +85,11 @@ from Caminhos.config_caminho import (
 )
 
 try:
+    from Caminhos.config_caminho import PASTA_OVERRIDE_KPIS
+except ImportError:
+    PASTA_OVERRIDE_KPIS = None
+
+try:
     from Caminhos.config_caminho import listar_backups_kpi
 except ImportError:
     def listar_backups_kpi(setor_id: Optional[str] = None, limite: int = 30) -> List[Dict[str, Any]]:
@@ -1134,14 +1139,16 @@ def inserir_abaixo_ultima_linha_kpi(
 
     linha_fim = linha_inicio + len(registros) - 1
 
-    # 2. Define o arquivo de destino (KPI Teste vs. KPI Oficial)
+    # 2. Define o arquivo de destino (KPI Teste vs. KPI Oficial vs. KPI Zerado de Homologação)
     caminho_backup: Optional[Path] = None
-    if modo_oficial:
+    eh_teste_zerado = bool(PASTA_OVERRIDE_KPIS or caminho_kpi_custom)
+
+    if modo_oficial or eh_teste_zerado:
         usuario_lock = verificar_lock_excel(kpi_oficial)
         if usuario_lock:
             return {
                 "ok": False,
-                "motivo": f"KPI Oficial está aberto no Excel por: '{usuario_lock}'. Feche antes de gravar.",
+                "motivo": f"KPI está aberto no Excel por: '{usuario_lock}'. Feche antes de gravar.",
             }
         PASTA_BACKUPS.mkdir(parents=True, exist_ok=True)
         carimbo = dt.datetime.now().strftime("%Y%m%d_%H%M%S")

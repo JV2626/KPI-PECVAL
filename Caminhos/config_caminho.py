@@ -77,6 +77,34 @@ PASTA_BASE_OPERACAO = (
 PASTA_MASTERS       = PASTA_BASE_OPERACAO / "Masters"
 PASTA_BACKUPS       = PASTA_BASE_OPERACAO / "Backups_KPI"
 PASTA_TESTES_KPI    = PASTA_BASE_OPERACAO / "KPIs_Teste"
+PASTA_KPIS_ZERADOS  = PASTA_BASE_OPERACAO / "KPIs_Zerados"
+
+# ==============================================================================
+# AMBIENTE CONTROLADO DE TESTES / HOMOLOGAÇÃO
+# ==============================================================================
+# Se definido, a automação redireciona toda a busca e gravação de KPIs para esta pasta,
+# isolando 100% os arquivos oficiais de produção da rede!
+PASTA_OVERRIDE_KPIS: Optional[Path] = None
+
+
+def ativar_ambiente_teste(pasta_kpis: Optional[Path] = None) -> Path:
+    """
+    Ativa o ambiente de testes apontando para uma pasta com KPIs zerados/testes.
+    Toda busca e gravação passa a ocorrer exclusivamente dentro desta pasta.
+    """
+    global PASTA_OVERRIDE_KPIS
+    p = Path(pasta_kpis) if pasta_kpis else PASTA_KPIS_ZERADOS
+    p.mkdir(parents=True, exist_ok=True)
+    PASTA_OVERRIDE_KPIS = p
+    limpar_caches_caminho()
+    return p
+
+
+def desativar_ambiente_teste() -> None:
+    """Desativa o ambiente de testes e restaura a busca dos KPIs oficiais da rede."""
+    global PASTA_OVERRIDE_KPIS
+    PASTA_OVERRIDE_KPIS = None
+    limpar_caches_caminho()
 
 # ==============================================================================
 # 2. SEPARAÇÃO ESTRITA: CAMINHOS DE APONTAMENTOS vs. CAMINHOS DOS KPIs OFICIAIS
@@ -453,14 +481,30 @@ def obter_pastas_busca_apontamentos(
 def obter_pastas_busca_kpi(setor_id: str, ano_alvo: int = 2026) -> List[Path]:
     """
     Retorna a lista ordenada de pastas onde procurar o KPI Oficial (.xlsx) do setor:
-    1º Na pasta Confidential do setor na rede (e subpastas dentro de Confidential);
-    2º Na pasta V:\\Joao ADM-Prod\\PECVAL;
-    3º Na pasta local (fallback para testes).
+    1º Se PASTA_OVERRIDE_KPIS estiver ativa, busca EXCLUSIVAMENTE na pasta de teste!
+    2º Na pasta Confidential do setor na rede (e subpastas dentro de Confidential);
+    3º Na pasta V:\\Joao ADM-Prod\\PECVAL;
+    4º Na pasta local (fallback para testes).
     Filtra estritamente subpastas arquivadas de anos legados (ex: 2025, 2024).
     """
     cfg = ESTRUTURA_SETORES[setor_id]
     pastas: List[Path] = []
     opcoes_sub = [cfg["subpasta_kpi"]] + cfg.get("subpastas_kpi_alternativas", [])
+
+    # Se o Ambiente de Testes com KPIs Zerados estiver ativo, busca EXCLUSIVAMENTE nele!
+    if PASTA_OVERRIDE_KPIS and PASTA_OVERRIDE_KPIS.exists():
+        pastas.append(PASTA_OVERRIDE_KPIS)
+        for sub_k in opcoes_sub:
+            cand = PASTA_OVERRIDE_KPIS / sub_k
+            if cand.exists() and cand not in pastas:
+                pastas.append(cand)
+        try:
+            for item in PASTA_OVERRIDE_KPIS.iterdir():
+                if item.is_dir() and item not in pastas:
+                    pastas.append(item)
+        except OSError:
+            pass
+        return pastas
 
     for raiz in RAIZES_KPIS_OFICIAIS_REDE:
         try:
@@ -564,10 +608,11 @@ def _eh_apontamento_do_setor(nome_norm: str, setor_id: str, sufixo: str, pasta_n
 
 
 def _eh_kpi_do_setor(nome_norm: str, setor_id: str, sufixo: str) -> bool:
-    """Verifica se o nome normalizado de um arquivo é o KPI Oficial do setor."""
+    """Verifica se o nome normalizado de um arquivo é o KPI do setor."""
     if sufixo != ".xlsx" or "kpi" not in nome_norm:
         return False
-    if any(bloq in nome_norm for bloq in ["teste", "master", "backup"]):
+    bloqueados = ["master", "backup"] if PASTA_OVERRIDE_KPIS else ["teste", "master", "backup"]
+    if any(bloq in nome_norm for bloq in bloqueados):
         return False
 
     if setor_id == "INJECAO":
@@ -625,7 +670,7 @@ def _chave_ordenacao_kpi(p: Path, ano_alvo: int = 2026) -> Tuple[int, int, int, 
     return (match_ano, ano_k, mes_k, mtime)
 
 
-_CACHE_LOCALIZAR_KPI: Dict[Tuple[str, int, Optional[int]], Tuple[float, Optional[Path]]] = {}
+_CACHE_LOCALIZAR_KPI: Dict[Tuple[str, int, Optional[int], str], Tuple[float, Optional[Path]]] = {}
 _CACHE_APONTAMENTOS: Dict[Tuple[str, Optional[int], int], Tuple[float, Dict[dt.date, List[Path]]]] = {}
 TTL_CACHE_REDE_SEGUNDOS = 120.0
 
@@ -652,7 +697,7 @@ def localizar_kpi_oficial(
         mes_alvo = ano_alvo
         ano_alvo = 2026
 
-    chave_cache = (setor_id, ano_alvo, mes_alvo, tuple(str(r) for r in RAIZES_KPIS_OFICIAIS_REDE))
+    chave_cache = (setor_id, ano_alvo, mes_alvo, str(PASTA_OVERRIDE_KPIS), tuple(str(r) for r in RAIZES_KPIS_OFICIAIS_REDE))
     agora = time.time()
     if chave_cache in _CACHE_LOCALIZAR_KPI:
         t_grav, res_cache = _CACHE_LOCALIZAR_KPI[chave_cache]

@@ -1790,6 +1790,7 @@ def menu_interativo_terminal() -> None:
         print("  [3] Escolher Mês/Setor/Dia -> Pré-Validar e Lançar no KPI")
         print("  [4] Abrir Hub Web Visual no Navegador")
         print("  [5] Restaurar Último Backup Oficial do KPI (Backups_KPI)")
+        print("  [6] 🧪 Testar em Pasta de KPIs Zerados (Ambiente Seguro)")
         print("  [0] Sair")
         opc = input("\nEscolha uma opção: ").strip()
 
@@ -1889,6 +1890,9 @@ def menu_interativo_terminal() -> None:
                 res_b = restaurar_ultimo_backup_kpi(s_bkp)
                 print(f"\n  {'✅ ' + res_b['mensagem'] if res_b.get('ok') else '❌ ' + res_b.get('motivo', '')}")
                 limpar_cache_hub()
+        elif opc == "6":
+            from Executar.testar_kpi_zerado import executar_teste_kpi_zerado
+            executar_teste_kpi_zerado()
 
 
 if __name__ == "__main__":
