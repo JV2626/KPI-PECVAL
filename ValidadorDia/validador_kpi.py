@@ -1195,6 +1195,10 @@ def inserir_abaixo_ultima_linha_kpi(
                     excel_app.DisplayAlerts = False
                     excel_app.ScreenUpdating = False
                     excel_app.EnableEvents = False
+                    try:
+                        excel_app.Calculation = -4135  # xlCalculationManual: suspende recálculo pesado durante colagem
+                    except Exception:
+                        pass
 
                     wb_com = excel_app.Workbooks.Open(str(temp_kpi.resolve()), UpdateLinks=0, ReadOnly=False)
                     nomes_abas = [wb_com.Sheets(i).Name for i in range(1, wb_com.Sheets.Count + 1)]
@@ -1257,7 +1261,11 @@ def inserir_abaixo_ultima_linha_kpi(
                                 except Exception:
                                     pass
                             formulas_preservadas = len(cols_prot_efetivas) * len(registros)
-
+                        try:
+                            excel_app.Calculation = -4105  # xlCalculationAutomatic: recalcula uma única vez ao final
+                            excel_app.Calculate()
+                        except Exception:
+                            pass
                         wb_com.Save()
                         motor_usado = "EXCEL_COM"
                 except Exception:

@@ -110,25 +110,28 @@ def extrair_apontamentos_injecao(
                 continue
 
             auditoria["linhas_brutas_lidas"] += (len(rows) - 11)
+            vazias_consecutivas = 0
             for r_idx in range(11, len(rows)):
                 r = rows[r_idx]
                 if not r or len(r) < 7:
                     auditoria["linhas_descartadas_vazias"] += 1
+                    vazias_consecutivas += 1
+                    if vazias_consecutivas >= 100:
+                        break
                     continue
 
                 operador = str(r[1] if len(r) > 1 and r[1] is not None else "").strip()
                 kanban   = str(r[2] if len(r) > 2 and r[2] is not None else "").strip()
                 maquina  = str(r[5] if len(r) > 5 and r[5] is not None else "").strip()
 
-                # Verifica se há parada, motivo ou horário preenchido para não descartar apontamento de setup/parada
-                tem_parada_ou_horario = any(
-                    (len(r) > col_i and r[col_i] not in (None, "", "0", 0, "0:00", 0.0))
-                    for col_i in range(70, min(len(r), 138))
-                )
-
-                if not kanban and not maquina and not operador and not tem_parada_ou_horario:
+                if not kanban and not maquina and not operador:
                     auditoria["linhas_descartadas_vazias"] += 1
+                    vazias_consecutivas += 1
+                    if vazias_consecutivas >= 100:
+                        break
                     continue
+
+                vazias_consecutivas = 0
 
                 qtd_raw = r[6] if len(r) > 6 else 0.0
                 ref_raw = r[65] if len(r) > 65 else 0.0

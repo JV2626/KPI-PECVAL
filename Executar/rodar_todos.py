@@ -385,10 +385,14 @@ def _extrair_registros_setor_padrao(
             auditoria["linhas_brutas_lidas"] += (len(rows) - 11)
             auditoria["detalhes_abas"].setdefault(nome_aba, {"linhas": 0, "pecas": 0.0, "refugo": 0.0})
 
+            vazias_consecutivas = 0
             for r_idx in range(11, len(rows)):
                 r = rows[r_idx]
                 if not r or len(r) < 7:
                     auditoria["linhas_descartadas_vazias"] += 1
+                    vazias_consecutivas += 1
+                    if vazias_consecutivas >= 100:
+                        break
                     continue
 
                 operador = str(r[1] if len(r) > 1 and r[1] is not None else "").strip()
@@ -398,11 +402,19 @@ def _extrair_registros_setor_padrao(
                 if setor_id == "INJECAO":
                     if not kanban and not maquina and not operador:
                         auditoria["linhas_descartadas_vazias"] += 1
+                        vazias_consecutivas += 1
+                        if vazias_consecutivas >= 100:
+                            break
                         continue
                 else:
                     if not kanban or not maquina:
                         auditoria["linhas_descartadas_vazias"] += 1
+                        vazias_consecutivas += 1
+                        if vazias_consecutivas >= 100:
+                            break
                         continue
+
+                vazias_consecutivas = 0
 
                 if setor_id == "MONTAGEM":
                     if len(r) < 72:
